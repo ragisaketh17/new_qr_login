@@ -30,8 +30,23 @@ const os = require("os");
 const crypto = require("crypto");
 const QRCode = require("qrcode");
 
-const { open } = require("sqlite");
-const sqlite3 = require("sqlite3");
+const isVercel = Boolean(process.env.VERCEL);
+
+let open = null;
+let sqlite3 = null;
+let turso = null;
+
+if (isVercel) {
+  const { createClient } = require("@libsql/client");
+
+  turso = createClient({
+    url: process.env.TURSO_DATABASE_URL,
+    authToken: process.env.TURSO_AUTH_TOKEN,
+  });
+} else {
+  ({ open } = require("sqlite"));
+  sqlite3 = require("sqlite3");
+}
 
 const app = express();
 
@@ -484,5 +499,3 @@ if (require.main === module) {
 }
 
 module.exports = app;
-
-
