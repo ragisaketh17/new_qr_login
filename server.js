@@ -1,24 +1,39 @@
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
+const crypto = require("crypto");
+const QRCode = require("qrcode");
+const mysql = require("mysql2/promise");
+const { OAuth2Client } = require("google-auth-library");
 
-// Load environment variables from .env file if present
+// --------------------------------------------------
+// LOAD .ENV
+// --------------------------------------------------
+
 const envPath = path.join(__dirname, ".env");
+
 if (fs.existsSync(envPath)) {
   try {
-    if (typeof process.loadEnvFile === "function") {
-      process.loadEnvFile(envPath);
-    } else {
-      const content = fs.readFileSync(envPath, "utf-8");
-      for (const line of content.split(/\r?\n/)) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith("#")) continue;
-        const eqIdx = trimmed.indexOf("=");
-        if (eqIdx !== -1) {
-          const key = trimmed.slice(0, eqIdx).trim();
-          const val = trimmed.slice(eqIdx + 1).trim().replace(/^['"](.*)['"]$/, "$1");
-          if (!process.env[key]) process.env[key] = val;
-        }
+    const content = fs.readFileSync(envPath, "utf-8");
+
+    for (const line of content.split(/\r?\n/)) {
+      const trimmed = line.trim();
+
+      if (!trimmed || trimmed.startsWith("#")) continue;
+
+      const eqIdx = trimmed.indexOf("=");
+
+      if (eqIdx !== -1) {
+        const key = trimmed.slice(0, eqIdx).trim();
+
+        const val = trimmed
+          .slice(eqIdx + 1)
+          .trim()
+          .replace(/^['"](.*)['"]$/, "$1");
+
+        // Always override process.env with values from .env file
+        process.env[key] = val;
       }
     }
   } catch (err) {
@@ -26,490 +41,1945 @@ if (fs.existsSync(envPath)) {
   }
 }
 
-const os = require("os");
-const crypto = require("crypto");
-const QRCode = require("qrcode");
-
-const isVercel = Boolean(process.env.VERCEL);
-
-// The local SQLite packages are only loaded on your own computer.
-// On Vercel (or whenever Turso is used) they are never loaded, so they cannot crash the server.
-let open = null;
-let sqlite3 = null;
-
-if (!isVercel && !process.env.TURSO_DATABASE_URL) {
-  ({ open } = require("sqlite"));
-  sqlite3 = require("sqlite3");
-}
+// --------------------------------------------------
+// APP
+// --------------------------------------------------
 
 const app = express();
 
-const dbPath = process.env.DB_PATH || path.join(__dirname, "users.db");
+const PORT = Number(process.env.PORT || 3000);
 
-const PORT = process.env.PORT || 3000;
+const googleClient = new OAuth2Client(
+  process.env.GOOGLE_CLIENT_ID
+);
 
-// 0 = every scan counts as a visit.
-// To ignore repeat scans, set minutes, e.g. 30 = at most one visit per 30 minutes.
-const VISIT_COOLDOWN_MINUTES = Number(process.env.VISIT_COOLDOWN_MINUTES ?? 0);
+// --------------------------------------------------
+// SETTINGS
+// --------------------------------------------------
+
+const VISIT_COOLDOWN_MINUTES = Number(
+  process.env.VISIT_COOLDOWN_MINUTES ?? 0
+);
 
 const COOKIE_NAME = "mart_session";
-const ONE_YEAR_MS = 365 * 24 * 60 * 60 * 1000;
-const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
-// --- OFFERS: edit these to match your mart. Keep them in order, smallest minVisits first. ---
-const OFFERS = [
+const ONE_YEAR_MS =
+  365 * 24 * 60 * 60 * 1000;
+
+const EMAIL_PATTERN =
+  /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+// --------------------------------------------------
+// URL HELPERS
+// --------------------------------------------------
+
+const safeUrl = (value) => {
+  const text = String(value || "").trim();
+
+  return /^https:\/\//i.test(text)
+    ? text
+    : "";
+};
+
+const GOOGLE_REVIEW_URL =
+  safeUrl(process.env.GOOGLE_REVIEW_URL);
+
+const INSTAGRAM_URL =
+  safeUrl(process.env.INSTAGRAM_URL);
+
+const FACEBOOK_URL =
+  safeUrl(process.env.FACEBOOK_URL);
+
+// --------------------------------------------------
+// GOOGLE REVIEWS
+// --------------------------------------------------
+
+const GOOGLE_PLACES_API_KEY =
+  (process.env.GOOGLE_PLACES_API_KEY || "").trim();
+
+const GOOGLE_PLACE_ID =
+  (process.env.GOOGLE_PLACE_ID || "").trim();
+
+const REVIEWS_REFRESH_MS =
+  Number(
+    process.env.GOOGLE_REVIEWS_REFRESH_HOURS ?? 6
+  ) *
+  60 *
+  60 *
+  1000;
+
+const STORE_REVIEW_TEXT =
+  (process.env.GOOGLE_STORE_REVIEW_TEXT ?? "true") !==
+  "false";
+
+// --------------------------------------------------
+// DEFAULT OFFERS
+// --------------------------------------------------
+
+const DEFAULT_OFFERS = [
   {
     minVisits: 1,
     icon: "🎟️",
     headline: "Get 5% OFF",
-    text: "Welcome offer: 5% off your bill today.",
+    text: "Welcome offer: 5% off your bill today."
   },
   {
     minVisits: 3,
     icon: "🪙",
     headline: "Get 10% OFF",
-    text: "Regular customer: 10% off your bill today.",
+    text: "Regular customer: 10% off your bill today."
   },
   {
     minVisits: 5,
     icon: "🎁",
     headline: "Get A Free Gift",
-    text: "Loyal customer: collect a free gift at the counter.",
+    text: "Loyal customer: collect a free gift at the counter."
   },
   {
     minVisits: 10,
     icon: "👑",
     headline: "Get 15% OFF",
-    text: "VIP customer: 15% off every bill this month.",
-  },
+    text: "VIP customer: 15% off every bill this month."
+  }
 ];
 
-// claims is a Map of minVisits -> time the reward was claimed
-const buildOffers = (visits, claims = new Map()) => {
-  const offers = OFFERS.map((offer) => {
-    const unlocked = visits >= offer.minVisits;
-    const claimedAt = claims.get(offer.minVisits) || null;
-    const status = claimedAt ? "claimed" : unlocked ? "available" : "locked";
-    return { ...offer, unlocked, claimedAt, status };
+// --------------------------------------------------
+// DATABASE (XAMPP MySQL / MariaDB)
+// --------------------------------------------------
+
+function getDbConfig() {
+  if (process.env.DATABASE_URL) {
+    try {
+      const parsed = new URL(process.env.DATABASE_URL);
+      return {
+        host: parsed.hostname || "localhost",
+        port: parsed.port ? Number(parsed.port) : 3306,
+        user: decodeURIComponent(parsed.username || "root"),
+        password: decodeURIComponent(parsed.password || ""),
+        database: parsed.pathname ? parsed.pathname.replace(/^\//, "") : "mart_loyalty"
+      };
+    } catch {
+      // ignore parse failure and fall through
+    }
+  }
+
+  return {
+    host: process.env.DB_HOST || "localhost",
+    port: Number(process.env.DB_PORT || 3306),
+    user: process.env.DB_USER || "root",
+    password: process.env.DB_PASSWORD !== undefined ? process.env.DB_PASSWORD : "",
+    database: process.env.DB_NAME || "mart_loyalty"
+  };
+}
+
+let pool = null;
+
+const databaseReady = initializeDatabase();
+
+async function initializeDatabase() {
+  const config = getDbConfig();
+
+  // Step 1: Ensure target database exists in XAMPP MySQL
+  try {
+    const bootstrapConnection = await mysql.createConnection({
+      host: config.host,
+      port: config.port,
+      user: config.user,
+      password: config.password,
+      charset: "utf8mb4"
+    });
+
+    try {
+      await bootstrapConnection.query(
+        `CREATE DATABASE IF NOT EXISTS \`${config.database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`
+      );
+    } finally {
+      await bootstrapConnection.end();
+    }
+  } catch (err) {
+    if (err.code === "ECONNREFUSED" || err.code === "EACCES" || err.code === "ENOTFOUND") {
+      console.error("\n❌ Could not connect to MySQL server at " + config.host + ":" + config.port);
+      console.error("👉 Please ensure XAMPP is running and MySQL service is started in XAMPP Control Panel.\n");
+      throw err;
+    } else {
+      console.warn("Database pre-check notice:", err.message);
+    }
+  }
+
+  // Step 2: Create connection pool with database selected
+  pool = mysql.createPool({
+    host: config.host,
+    port: config.port,
+    user: config.user,
+    password: config.password,
+    database: config.database,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+    timezone: "Z",
+    charset: "utf8mb4"
   });
+
+  const connection = await pool.getConnection();
+
+  try {
+    await connection.ping();
+
+    console.log(`MySQL connection successful (Database: ${config.database}).`);
+
+    // ------------------------------------------------
+    // USERS
+    // ------------------------------------------------
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        email VARCHAR(254) NOT NULL,
+        createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        visitCount INT NOT NULL DEFAULT 0,
+        lastVisitAt DATETIME NULL,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_users_email (email)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // ------------------------------------------------
+    // SESSIONS
+    // ------------------------------------------------
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        tokenHash CHAR(64) NOT NULL,
+        userId BIGINT UNSIGNED NOT NULL,
+        createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_sessions_tokenHash (tokenHash),
+        KEY idx_sessions_userId (userId)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // ------------------------------------------------
+    // CLAIMS
+    // ------------------------------------------------
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS claims (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        userId BIGINT UNSIGNED NOT NULL,
+        minVisits INT NOT NULL,
+        claimedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_claim_user_reward (userId, minVisits),
+        KEY idx_claims_userId (userId),
+        KEY idx_claims_claimedAt (claimedAt)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // ------------------------------------------------
+    // SETTINGS
+    // ------------------------------------------------
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS settings (
+        settingKey VARCHAR(100) NOT NULL,
+        settingValue LONGTEXT NULL,
+        updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+          ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (settingKey)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // ------------------------------------------------
+    // VISITS
+    // ------------------------------------------------
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS visits (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        userId BIGINT UNSIGNED NOT NULL,
+        at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_visits_userId (userId),
+        KEY idx_visits_at (at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // ------------------------------------------------
+    // REVIEWS
+    // ------------------------------------------------
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS reviews (
+        id VARCHAR(255) NOT NULL,
+        author VARCHAR(255) NOT NULL,
+        authorUrl TEXT NULL,
+        stars DECIMAL(3,1) NULL,
+        text TEXT NULL,
+        publishedAt DATETIME NULL,
+        syncedAt DATETIME NULL,
+        firstSeenAt DATETIME NULL,
+        PRIMARY KEY (id),
+        KEY idx_reviews_publishedAt (publishedAt)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // ------------------------------------------------
+    // AUTO-MIGRATE LEGACY / EXISTING COLUMNS
+    // ------------------------------------------------
+
+    const migrateColumn = async (table, oldCol, newCol, colDef) => {
+      try {
+        const [oldExists] = await connection.query(`
+          SELECT COLUMN_NAME
+          FROM INFORMATION_SCHEMA.COLUMNS
+          WHERE TABLE_SCHEMA = DATABASE()
+            AND TABLE_NAME = ?
+            AND COLUMN_NAME = ?
+        `, [table, oldCol]);
+
+        if (oldExists.length > 0) {
+          const [newExists] = await connection.query(`
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = ?
+              AND COLUMN_NAME = ?
+          `, [table, newCol]);
+
+          if (newExists.length === 0) {
+            await connection.query(
+              `ALTER TABLE \`${table}\` CHANGE COLUMN \`${oldCol}\` \`${newCol}\` ${colDef}`
+            );
+            console.log(`Auto-migrated column: ${table}.${oldCol} -> ${table}.${newCol}`);
+          }
+        }
+      } catch (e) {
+        console.warn(`Migration notice for ${table}.${oldCol}:`, e.message);
+      }
+    };
+
+    const ensureColumn = async (table, colName, colDef) => {
+      try {
+        const [exists] = await connection.query(`
+          SELECT COLUMN_NAME
+          FROM INFORMATION_SCHEMA.COLUMNS
+          WHERE TABLE_SCHEMA = DATABASE()
+            AND TABLE_NAME = ?
+            AND COLUMN_NAME = ?
+        `, [table, colName]);
+
+        if (exists.length === 0) {
+          await connection.query(`ALTER TABLE \`${table}\` ADD COLUMN \`${colName}\` ${colDef}`);
+          console.log(`Auto-added column: ${table}.${colName}`);
+        }
+      } catch (e) {
+        console.warn(`Column check notice for ${table}.${colName}:`, e.message);
+      }
+    };
+
+    // 1. Users table (created_at -> createdAt, visit_count -> visitCount, last_visit_at -> lastVisitAt)
+    await migrateColumn("users", "created_at", "createdAt", "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP");
+    await migrateColumn("users", "visit_count", "visitCount", "INT NOT NULL DEFAULT 0");
+    await migrateColumn("users", "last_visit_at", "lastVisitAt", "DATETIME NULL");
+    await ensureColumn("users", "createdAt", "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP");
+    await ensureColumn("users", "visitCount", "INT NOT NULL DEFAULT 0");
+    await ensureColumn("users", "lastVisitAt", "DATETIME NULL");
+
+    // 2. Settings table (name -> settingKey, value -> settingValue, updated_at -> updatedAt)
+    await migrateColumn("settings", "name", "settingKey", "VARCHAR(100) NOT NULL");
+    await migrateColumn("settings", "value", "settingValue", "LONGTEXT NULL");
+    await migrateColumn("settings", "updated_at", "updatedAt", "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP");
+    await ensureColumn("settings", "settingKey", "VARCHAR(100) NOT NULL");
+    await ensureColumn("settings", "settingValue", "LONGTEXT NULL");
+    await ensureColumn("settings", "updatedAt", "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP");
+
+    // 3. Sessions table (token_hash -> tokenHash, user_id -> userId, created_at -> createdAt)
+    await migrateColumn("sessions", "token_hash", "tokenHash", "CHAR(64) NOT NULL");
+    await migrateColumn("sessions", "user_id", "userId", "BIGINT UNSIGNED NOT NULL");
+    await migrateColumn("sessions", "created_at", "createdAt", "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP");
+    await ensureColumn("sessions", "tokenHash", "CHAR(64) NOT NULL");
+    await ensureColumn("sessions", "userId", "BIGINT UNSIGNED NOT NULL");
+
+    // 4. Claims table (user_id -> userId, min_visits -> minVisits, claimed_at -> claimedAt)
+    await migrateColumn("claims", "user_id", "userId", "BIGINT UNSIGNED NOT NULL");
+    await migrateColumn("claims", "min_visits", "minVisits", "INT NOT NULL");
+    await migrateColumn("claims", "claimed_at", "claimedAt", "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP");
+    await ensureColumn("claims", "userId", "BIGINT UNSIGNED NOT NULL");
+    await ensureColumn("claims", "minVisits", "INT NOT NULL");
+    await ensureColumn("claims", "claimedAt", "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP");
+
+    // 5. Visits table (user_id -> userId, visited_at -> at)
+    await migrateColumn("visits", "user_id", "userId", "BIGINT UNSIGNED NOT NULL");
+    await migrateColumn("visits", "visited_at", "at", "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP");
+    await ensureColumn("visits", "userId", "BIGINT UNSIGNED NOT NULL");
+    await ensureColumn("visits", "at", "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP");
+
+    // 6. Reviews table (author_url -> authorUrl, review_text -> text, etc.)
+    await migrateColumn("reviews", "author_url", "authorUrl", "TEXT NULL");
+    await migrateColumn("reviews", "review_text", "text", "TEXT NULL");
+    await migrateColumn("reviews", "published_at", "publishedAt", "DATETIME NULL");
+    await migrateColumn("reviews", "first_seen_at", "firstSeenAt", "DATETIME NULL");
+    await migrateColumn("reviews", "synced_at", "syncedAt", "DATETIME NULL");
+    await ensureColumn("reviews", "text", "TEXT NULL");
+  } finally {
+    connection.release();
+  }
+}
+
+app.locals.databaseReady = databaseReady;
+
+databaseReady.catch(() => { });
+
+// --------------------------------------------------
+// GENERIC DB HELPERS
+// --------------------------------------------------
+
+async function query(sql, params = []) {
+  const [rows] = await pool.query(sql, params);
+  return rows;
+}
+
+async function execute(sql, params = []) {
+  const [result] = await pool.query(sql, params);
+  return result;
+}
+
+// --------------------------------------------------
+// OFFERS
+// --------------------------------------------------
+
+function buildOffers(
+  visits,
+  claims = new Map(),
+  offerList = DEFAULT_OFFERS
+) {
+  const offers = offerList.map((offer) => {
+    const unlocked = visits >= offer.minVisits;
+
+    const claimedAt =
+      claims.get(offer.minVisits) || null;
+
+    const status = claimedAt
+      ? "claimed"
+      : unlocked
+        ? "available"
+        : "locked";
+
+    return {
+      ...offer,
+      unlocked,
+      claimedAt,
+      status
+    };
+  });
+
   const currentIndex = offers.reduce(
-    (last, offer, index) => (offer.unlocked ? index : last),
+    (last, offer, index) =>
+      offer.unlocked ? index : last,
     -1
   );
-  const nextOffer = OFFERS.find((offer) => visits < offer.minVisits);
+
+  const nextOffer = offerList.find(
+    (offer) => visits < offer.minVisits
+  );
+
   const next = nextOffer
-    ? { headline: nextOffer.headline, visitsAway: nextOffer.minVisits - visits }
+    ? {
+      headline: nextOffer.headline,
+      visitsAway:
+        nextOffer.minVisits - visits
+    }
     : null;
-  return { offers, currentIndex, next };
+
+  return {
+    offers,
+    currentIndex,
+    next
+  };
+}
+
+// --------------------------------------------------
+// DATE
+// --------------------------------------------------
+
+const toIso = (value) => {
+  if (!value) return null;
+
+  return new Date(value).toISOString();
 };
 
-// SQLite stores "2026-10-07 09:30:00" (UTC). Turn it into a proper date string.
-const toIso = (sqliteTime) => `${sqliteTime.replace(" ", "T")}Z`;
+// --------------------------------------------------
+// NETWORK HELPERS
+// --------------------------------------------------
 
-// --- Network helpers: find the address a phone should use ---
 const getLanAddresses = () => {
   const found = [];
-  for (const [name, list] of Object.entries(os.networkInterfaces())) {
+
+  for (const [name, list] of Object.entries(
+    os.networkInterfaces()
+  )) {
     for (const i of list || []) {
-      const isV4 = i.family === "IPv4" || i.family === 4;
-      if (isV4 && !i.internal && !i.address.startsWith("169.254.")) {
-        found.push({ name, address: i.address });
+      const isV4 =
+        i.family === "IPv4" ||
+        i.family === 4;
+
+      if (
+        isV4 &&
+        !i.internal &&
+        !i.address.startsWith("169.254.")
+      ) {
+        found.push({
+          name,
+          address: i.address
+        });
       }
     }
   }
+
   return found;
 };
 
-// Prefer real Wi-Fi adapters, avoid virtual ones (WSL, VMware, VPN...)
-const scoreAddress = ({ name, address }) => {
+const scoreAddress = ({
+  name,
+  address
+}) => {
   const n = name.toLowerCase();
+
   let score = 0;
-  if (/wi-?fi|wlan|wireless/.test(n)) score += 3;
-  if (/vethernet|vmware|virtualbox|wsl|hyper-v|docker|vpn|tap|tun/.test(n)) score -= 5;
-  if (address.startsWith("192.168.")) score += 2;
-  else if (address.startsWith("10.")) score += 1;
+
+  if (/wi-?fi|wlan|wireless/.test(n)) {
+    score += 3;
+  }
+
+  if (
+    /vethernet|vmware|virtualbox|wsl|hyper-v|docker|vpn|tap|tun/.test(
+      n
+    )
+  ) {
+    score -= 5;
+  }
+
+  if (address.startsWith("192.168.")) {
+    score += 2;
+  } else if (address.startsWith("10.")) {
+    score += 1;
+  }
+
   return score;
 };
 
-// Cleans up PUBLIC_URL: removes spaces and trailing slashes, adds https:// if missing.
 const normalizeUrl = (value) => {
-  const trimmed = value.trim().replace(/\/+$/, "");
-  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  const trimmed = value
+    .trim()
+    .replace(/\/+$/, "");
+
+  return /^https?:\/\//i.test(trimmed)
+    ? trimmed
+    : `https://${trimmed}`;
 };
 
 const getPublicUrl = () =>
+  process.env.SITE_URL?.trim() ||
   process.env.PUBLIC_URL?.trim() ||
   process.env.RENDER_EXTERNAL_URL?.trim() ||
   process.env.VERCEL_URL?.trim() ||
   "";
 
-// If PUBLIC_URL is set (tunnel or deployed site), that wins. Works on mobile data.
-// Otherwise we use the computer's Wi-Fi address, which only works on the same Wi-Fi.
 const getBaseUrl = () => {
   const publicUrl = getPublicUrl();
+
   if (publicUrl) {
     return normalizeUrl(publicUrl);
   }
-  const best = getLanAddresses().sort((a, b) => scoreAddress(b) - scoreAddress(a))[0];
+
+  const best = getLanAddresses()
+    .sort(
+      (a, b) =>
+        scoreAddress(b) -
+        scoreAddress(a)
+    )[0];
+
   return `http://${best ? best.address : "localhost"}:${PORT}`;
 };
 
-// The QR code points here. Every scan of this link adds one visit.
-const getScanUrl = () => `${getBaseUrl()}/scan`;
+const getScanUrl = () =>
+  `${getBaseUrl()}/scan`;
 
-let db = null;
+// --------------------------------------------------
+// SETTINGS HELPERS
+// --------------------------------------------------
 
-// Connects to Turso (the online database).
-// It gives back the same methods as the sqlite package (run, get, all, exec),
-// so none of the routes below have to change.
-const createLibsqlDatabase = () => {
-  const { createClient } = require("@libsql/client");
-  const client = createClient({
-    // plain https works best on Vercel
-    url: process.env.TURSO_DATABASE_URL.replace(/^libsql:\/\//, "https://"),
-    authToken: process.env.TURSO_AUTH_TOKEN,
-  });
+async function getSetting(key) {
+  const rows = await query(
+    `
+      SELECT settingValue
+      FROM settings
+      WHERE settingKey = ?
+      LIMIT 1
+    `,
+    [key]
+  );
+
+  if (!rows.length) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(rows[0].settingValue);
+  } catch {
+    return rows[0].settingValue;
+  }
+}
+
+async function saveSetting(key, value) {
+  const json = JSON.stringify(value);
+
+  await execute(
+    `
+      INSERT INTO settings
+        (settingKey, settingValue)
+      VALUES (?, ?)
+      ON DUPLICATE KEY UPDATE
+        settingValue = VALUES(settingValue),
+        updatedAt = CURRENT_TIMESTAMP
+    `,
+    [key, json]
+  );
+}
+
+async function deleteSetting(key) {
+  await execute(
+    `
+      DELETE FROM settings
+      WHERE settingKey = ?
+    `,
+    [key]
+  );
+}
+
+// --------------------------------------------------
+// GOOGLE REVIEWS
+// --------------------------------------------------
+
+let reviewSync = null;
+let reviewFailedAt = 0;
+
+const syncGoogleReviews = async (force = false) => {
+  if (
+    !GOOGLE_PLACES_API_KEY ||
+    !GOOGLE_PLACE_ID
+  ) {
+    return null;
+  }
+
+  const saved = await getSetting(
+    "googleSummary"
+  );
+
+  if (
+    !force &&
+    saved?.fetchedAt &&
+    Date.now() -
+    new Date(saved.fetchedAt).getTime() <
+    REVIEWS_REFRESH_MS
+  ) {
+    return saved;
+  }
+
+  if (
+    !force &&
+    Date.now() - reviewFailedAt <
+    10 * 60 * 1000
+  ) {
+    return saved;
+  }
+
+  if (reviewSync) {
+    return reviewSync;
+  }
+
+  reviewSync = (async () => {
+    try {
+      const res = await fetch(
+        `https://places.googleapis.com/v1/places/${encodeURIComponent(
+          GOOGLE_PLACE_ID
+        )}`,
+        {
+          headers: {
+            "X-Goog-Api-Key":
+              GOOGLE_PLACES_API_KEY,
+            "X-Goog-FieldMask":
+              "rating,userRatingCount,reviews"
+          }
+        }
+      );
+
+      if (!res.ok) {
+        throw new Error(
+          `Places API ${res.status}`
+        );
+      }
+
+      const place = await res.json();
+
+      const now = new Date();
+
+      console.log(
+        `Google Reviews Sync: rating ${place.rating}, ${place.userRatingCount} ratings, ${(place.reviews || []).length} reviews returned`
+      );
+
+      for (const r of place.reviews || []) {
+        if (!r.name) continue;
+
+        const author =
+          r.authorAttribution
+            ?.displayName ||
+          "Google user";
+
+        const authorUrl =
+          r.authorAttribution?.uri ||
+          null;
+
+        const stars =
+          r.rating ?? null;
+
+        const publishedAt =
+          r.publishTime
+            ? new Date(r.publishTime)
+            : null;
+
+        const text =
+          STORE_REVIEW_TEXT
+            ? r.text?.text ||
+            r.originalText?.text ||
+            ""
+            : "";
+
+        await execute(
+          `
+            INSERT INTO reviews
+              (
+                id,
+                author,
+                authorUrl,
+                stars,
+                text,
+                publishedAt,
+                syncedAt,
+                firstSeenAt
+              )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON DUPLICATE KEY UPDATE
+              author = VALUES(author),
+              authorUrl = VALUES(authorUrl),
+              stars = VALUES(stars),
+              text = VALUES(text),
+              publishedAt = VALUES(publishedAt),
+              syncedAt = VALUES(syncedAt)
+          `,
+          [
+            r.name,
+            author,
+            authorUrl,
+            stars,
+            text,
+            publishedAt,
+            now,
+            now
+          ]
+        );
+      }
+
+      const summary = {
+        rating:
+          place.rating ?? null,
+        count:
+          place.userRatingCount ?? 0,
+        fetchedAt: now
+      };
+
+      await saveSetting(
+        "googleSummary",
+        summary
+      );
+
+      return summary;
+    } catch (e) {
+      reviewFailedAt = Date.now();
+
+      console.log(
+        `Google Reviews Sync Error: ${e.message}`
+      );
+
+      return saved;
+    } finally {
+      reviewSync = null;
+    }
+  })();
+
+  return reviewSync;
+};
+
+// --------------------------------------------------
+// OFFERS
+// --------------------------------------------------
+
+const getOffers = async () => {
+  const doc = await getSetting("offers");
+
+  if (
+    Array.isArray(doc) &&
+    doc.length > 0
+  ) {
+    return doc;
+  }
+
+  return DEFAULT_OFFERS;
+};
+
+// --------------------------------------------------
+// LINKS
+// --------------------------------------------------
+
+const getLinks = async () => {
+  const doc = await getSetting("links");
+
+  const pick = (
+    key,
+    fallback
+  ) => {
+    return typeof doc?.[key] === "string"
+      ? doc[key]
+      : fallback;
+  };
 
   return {
-    async run(sql, args = []) {
-      const result = await client.execute({ sql, args });
-      return {
-        changes: Number(result.rowsAffected),
-        lastID: Number(result.lastInsertRowid),
-      };
-    },
-    async get(sql, args = []) {
-      const result = await client.execute({ sql, args });
-      return result.rows[0];
-    },
-    async all(sql, args = []) {
-      const result = await client.execute({ sql, args });
-      return result.rows;
-    },
-    exec(sql) {
-      return client.executeMultiple(sql);
-    },
+    googleReviewUrl: safeUrl(
+      pick(
+        "googleReviewUrl",
+        GOOGLE_REVIEW_URL
+      )
+    ),
+
+    instagramUrl: safeUrl(
+      pick(
+        "instagramUrl",
+        INSTAGRAM_URL
+      )
+    ),
+
+    facebookUrl: safeUrl(
+      pick(
+        "facebookUrl",
+        FACEBOOK_URL
+      )
+    )
   };
 };
 
-const initializeDatabase = async () => {
-  if (process.env.VERCEL && (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN)) {
-    throw new Error("TURSO_DATABASE_URL and TURSO_AUTH_TOKEN are required on Vercel.");
-  }
+// --------------------------------------------------
+// SESSION HELPERS
+// --------------------------------------------------
 
-  if (process.env.TURSO_DATABASE_URL) {
-    // Online database (use this on Vercel)
-    db = createLibsqlDatabase();
-  } else {
-    // Local file users.db (use this on your computer)
-    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-    db = await open({
-      filename: dbPath,
-      driver: sqlite3.Database,
-    });
-    await db.run(`PRAGMA foreign_keys = ON;`);
-  }
-
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
-      email         TEXT NOT NULL UNIQUE,
-      created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      visit_count   INTEGER NOT NULL DEFAULT 0,
-      last_visit_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS sessions (
-      token_hash TEXT PRIMARY KEY,
-      user_id    INTEGER NOT NULL REFERENCES users(id),
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS claims (
-      user_id    INTEGER NOT NULL REFERENCES users(id),
-      min_visits INTEGER NOT NULL,
-      claimed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (user_id, min_visits)
-    );
-  `);
-};
-
-const databaseReady = initializeDatabase();
-app.locals.databaseReady = databaseReady;
-databaseReady.catch(() => { }); // stops a startup error from crashing Node; the middleware below reports it
-
-// --- Helpers ---
 const hashToken = (token) =>
-  crypto.createHash("sha256").update(token).digest("hex");
+  crypto
+    .createHash("sha256")
+    .update(token)
+    .digest("hex");
 
-const getCookie = (request, name) => {
-  const header = request.headers.cookie || "";
+const getCookie = (
+  request,
+  name
+) => {
+  const header =
+    request.headers.cookie || "";
+
   for (const part of header.split(";")) {
-    const [key, ...rest] = part.trim().split("=");
-    if (key === name) return decodeURIComponent(rest.join("="));
+    const [key, ...rest] =
+      part.trim().split("=");
+
+    if (key === name) {
+      return decodeURIComponent(
+        rest.join("=")
+      );
+    }
   }
+
   return null;
 };
 
-// Finds the signed-in customer from the cookie (or null).
-const getUserFromRequest = async (request) => {
-  const token = getCookie(request, COOKIE_NAME);
-  if (!token) return null;
-  const user = await db.get(
+const getUserFromRequest = async (
+  request
+) => {
+  const token = getCookie(
+    request,
+    COOKIE_NAME
+  );
+
+  if (!token) {
+    return null;
+  }
+
+  const rows = await query(
     `
-    SELECT users.* FROM sessions
-    JOIN users ON users.id = sessions.user_id
-    WHERE sessions.token_hash = ?;
+      SELECT
+        u.id,
+        u.email,
+        u.createdAt,
+        u.visitCount,
+        u.lastVisitAt
+      FROM sessions s
+      INNER JOIN users u
+        ON u.id = s.userId
+      WHERE s.tokenHash = ?
+      LIMIT 1
     `,
     [hashToken(token)]
   );
-  return user || null;
+
+  return rows[0] || null;
 };
 
-// Adds 1 visit. Returns true if it was counted.
-const addVisit = async (userId) => {
-  const result = await db.run(
-    `
-    UPDATE users
-    SET visit_count = visit_count + 1, last_visit_at = CURRENT_TIMESTAMP
-    WHERE id = ?
-      AND (last_visit_at IS NULL
-           OR (julianday('now') - julianday(last_visit_at)) * 1440 >= ?);
-    `,
-    [userId, VISIT_COOLDOWN_MINUTES]
+// --------------------------------------------------
+// ADD VISIT
+// --------------------------------------------------
+
+const addVisit = async (
+  userId
+) => {
+  const now = new Date();
+
+  const cutoff = new Date(
+    now.getTime() -
+    VISIT_COOLDOWN_MINUTES *
+    60 *
+    1000
   );
-  return result.changes === 1;
+
+  const result = await execute(
+    `
+      UPDATE users
+      SET
+        visitCount = visitCount + 1,
+        lastVisitAt = ?
+      WHERE id = ?
+        AND (
+          lastVisitAt IS NULL
+          OR lastVisitAt <= ?
+        )
+    `,
+    [
+      now,
+      userId,
+      cutoff
+    ]
+  );
+
+  const counted =
+    result.affectedRows === 1;
+
+  if (counted) {
+    try {
+      await execute(
+        `
+          INSERT INTO visits
+            (userId, at)
+          VALUES (?, ?)
+        `,
+        [userId, now]
+      );
+    } catch (e) {
+      console.log(
+        `Visit Log Error: ${e.message}`
+      );
+    }
+  }
+
+  return counted;
 };
 
-// What the page shows: email, visit count, offers and claimed status. Does NOT add a visit.
-const getStatus = async (userId) => {
-  const user = await db.get(`SELECT * FROM users WHERE id = ?;`, [userId]);
-  const rows = await db.all(
-    `SELECT min_visits, claimed_at FROM claims WHERE user_id = ?;`,
+// --------------------------------------------------
+// STATUS
+// --------------------------------------------------
+
+const getStatus = async (
+  userId
+) => {
+  const users = await query(
+    `
+      SELECT
+        id,
+        email,
+        visitCount
+      FROM users
+      WHERE id = ?
+      LIMIT 1
+    `,
     [userId]
   );
-  const claims = new Map(rows.map((row) => [row.min_visits, toIso(row.claimed_at)]));
+
+  if (!users.length) {
+    throw new Error(
+      "User not found."
+    );
+  }
+
+  const user = users[0];
+
+  const offerList =
+    await getOffers();
+
+  const rows = await query(
+    `
+      SELECT
+        minVisits,
+        claimedAt
+      FROM claims
+      WHERE userId = ?
+    `,
+    [userId]
+  );
+
+  const claims = new Map(
+    rows.map((row) => [
+      Number(row.minVisits),
+      toIso(row.claimedAt)
+    ])
+  );
+
   return {
     ok: true,
     email: user.email,
-    visits: user.visit_count,
-    ...buildOffers(user.visit_count, claims),
+    visits: Number(
+      user.visitCount
+    ),
+    ...buildOffers(
+      Number(user.visitCount),
+      claims,
+      offerList
+    )
   };
 };
 
-// --- Middleware ---
-// Trust the tunnel / host proxy, so request.secure is true when the visitor used https.
-app.set("trust proxy", 1);
-app.use(express.json({ limit: "2kb" }));
-app.use("/api", (request, response, next) => {
-  response.set("Cache-Control", "no-store");
-  next();
-});
+// --------------------------------------------------
+// SIGN IN
+// --------------------------------------------------
 
-// --- Connection test (answers even if the database is down) ---
-app.get("/health", (request, response) => {
-  response.type("text").send("OK");
-});
+const signInUser = async (
+  request,
+  response,
+  email
+) => {
+  let users = await query(
+    `
+      SELECT *
+      FROM users
+      WHERE email = ?
+      LIMIT 1
+    `,
+    [email]
+  );
 
-// Every request below waits until the database is ready (the first visit on Vercel needs this)
-app.use(async (request, response, next) => {
-  try {
-    await databaseReady;
-    next();
-  } catch (e) {
-    console.log(`DB Error: ${e.message}`);
-    response.status(500).json({ error: "Database not available. Check the Turso settings." });
-  }
-});
+  let user;
 
-// --- QR routes ---
-app.get("/qr.png", async (request, response) => {
-  try {
-    const png = await QRCode.toBuffer(getScanUrl(), { width: 600, margin: 2 });
-    response.type("png").send(png);
-  } catch (e) {
-    response.status(500).send("Could not create QR code");
-  }
-});
-
-app.get("/qr", (request, response) => {
-  response.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Scan to open</title>
-</head>
-<body style="font-family:sans-serif;text-align:center;padding:2rem">
-  <h1>Scan to open</h1>
-  <img src="/qr.png" alt="QR code" width="300" height="300">
-  <p>${getScanUrl()}</p>
-</body>
-</html>`);
-});
-
-// --- THE SCAN LINK: every scan adds one visit, then opens the page ---
-app.get("/scan", async (request, response) => {
-  response.set("Cache-Control", "no-store");
-  let counted = false;
-  try {
-    const user = await getUserFromRequest(request);
-    if (user) {
-      counted = await addVisit(user.id);
-    }
-  } catch (e) {
-    console.log(`Scan Error: ${e.message}`);
-  }
-  response.redirect(counted ? "/?counted=1" : "/");
-});
-
-app.use(express.static(path.join(__dirname, "public")));
-
-// --- API 1: Sign in with email. Saves the email, remembers this phone, counts this visit. ---
-app.post("/api/login", async (request, response) => {
-  const email = String(request.body?.email ?? "").trim().toLowerCase();
-
-  if (!email || email.length > 254 || !EMAIL_PATTERN.test(email)) {
-    return response.status(400).json({ error: "Enter a valid email address." });
-  }
-
-  try {
-    await db.run(`INSERT OR IGNORE INTO users (email) VALUES (?);`, [email]);
-    const user = await db.get(`SELECT * FROM users WHERE email = ?;`, [email]);
-
-    const token = crypto.randomBytes(32).toString("hex");
-    await db.run(
-      `INSERT INTO sessions (token_hash, user_id) VALUES (?, ?);`,
-      [hashToken(token), user.id]
+  if (users.length) {
+    user = users[0];
+  } else {
+    const result = await execute(
+      `
+        INSERT INTO users
+          (
+            email,
+            createdAt,
+            visitCount,
+            lastVisitAt
+          )
+        VALUES (?, ?, 0, NULL)
+      `,
+      [email, new Date()]
     );
 
-    response.cookie(COOKIE_NAME, token, {
+    users = await query(
+      `
+        SELECT *
+        FROM users
+        WHERE id = ?
+        LIMIT 1
+      `,
+      [result.insertId]
+    );
+
+    user = users[0];
+  }
+
+  const token =
+    crypto.randomBytes(32).toString(
+      "hex"
+    );
+
+  await execute(
+    `
+      INSERT INTO sessions
+        (
+          tokenHash,
+          userId,
+          createdAt
+        )
+      VALUES (?, ?, ?)
+    `,
+    [
+      hashToken(token),
+      user.id,
+      new Date()
+    ]
+  );
+
+  response.cookie(
+    COOKIE_NAME,
+    token,
+    {
       httpOnly: true,
       sameSite: "lax",
-      secure: request.secure, // true on https links (tunnel or hosted site), false on plain http
-      maxAge: ONE_YEAR_MS,
-    });
-
-    const counted = await addVisit(user.id);
-    response.json({ ...(await getStatus(user.id)), newVisit: counted });
-  } catch (e) {
-    console.log(`Login Error: ${e.message}`);
-    response.status(500).json({ error: "Could not save your email. Try again." });
-  }
-});
-
-// --- API 2: Who is this phone? Returns visits, offers and claims (does not add a visit). ---
-app.get("/api/me", async (request, response) => {
-  try {
-    const user = await getUserFromRequest(request);
-    if (!user) {
-      response.clearCookie(COOKIE_NAME);
-      return response.status(401).json({
-        error: "Not signed in.",
-        offers: buildOffers(0).offers,
-      });
+      secure: request.secure,
+      maxAge: ONE_YEAR_MS
     }
-    response.json(await getStatus(user.id));
-  } catch (e) {
-    console.log(`Me Error: ${e.message}`);
-    response.status(500).json({ error: "Something went wrong. Try again." });
-  }
-});
+  );
 
-// --- API 3: Claim a reward (only works if it is unlocked, and only once) ---
-app.post("/api/claim", async (request, response) => {
-  try {
-    const user = await getUserFromRequest(request);
-    if (!user) {
-      return response.status(401).json({ error: "Please sign in first." });
-    }
+  const counted =
+    await addVisit(user.id);
 
-    const minVisits = Number(request.body?.minVisits);
-    const offer = OFFERS.find((item) => item.minVisits === minVisits);
-    if (!offer) {
-      return response.status(400).json({ error: "Unknown reward." });
-    }
-    if (user.visit_count < offer.minVisits) {
-      return response.status(400).json({ error: "This reward is not unlocked yet." });
-    }
+  return {
+    ...(await getStatus(user.id)),
+    newVisit: counted
+  };
+};
 
-    const result = await db.run(
-      `INSERT OR IGNORE INTO claims (user_id, min_visits) VALUES (?, ?);`,
-      [user.id, offer.minVisits]
+// --------------------------------------------------
+// MIDDLEWARE
+// --------------------------------------------------
+
+app.set("trust proxy", 1);
+
+app.use(
+  express.json({
+    limit: "32kb"
+  })
+);
+
+app.use(
+  "/api",
+  (request, response, next) => {
+    response.set(
+      "Cache-Control",
+      "no-store"
     );
 
-    response.json({ ...(await getStatus(user.id)), justClaimed: result.changes === 1 });
-  } catch (e) {
-    console.log(`Claim Error: ${e.message}`);
-    response.status(500).json({ error: "Could not claim the reward. Try again." });
+    next();
   }
-});
+);
 
-// --- API 4: Sign out ---
-app.post("/api/logout", async (request, response) => {
-  const token = getCookie(request, COOKIE_NAME);
-  try {
-    if (token) {
-      await db.run(`DELETE FROM sessions WHERE token_hash = ?;`, [hashToken(token)]);
+// --------------------------------------------------
+// HEALTH
+// --------------------------------------------------
+
+app.get(
+  "/health",
+  async (request, response) => {
+    try {
+      await databaseReady;
+
+      await query(
+        "SELECT 1"
+      );
+
+      response
+        .type("text")
+        .send("OK");
+    } catch (e) {
+      response
+        .status(500)
+        .type("text")
+        .send("Database error");
     }
-  } catch (e) {
-    console.log(`Logout Error: ${e.message}`);
   }
-  response.clearCookie(COOKIE_NAME);
-  response.json({ ok: true });
-});
+);
 
-// The owner's dashboard lives in its own file (dashboard.js)
-require("./dashboard")(app, { getDb: () => db, getCookie, OFFERS, toIso });
+// --------------------------------------------------
+// CONFIG
+// --------------------------------------------------
 
-// --- Running on your computer: npm start / start.ps1 ---
-// On Vercel nothing starts here. The app is exported on the last line instead.
+app.get(
+  "/api/config",
+  async (
+    request,
+    response
+  ) => {
+    let rating =
+      (
+        process.env.GOOGLE_RATING ||
+        ""
+      ).trim();
+
+    let count = null;
+
+    let links = {
+      googleReviewUrl:
+        GOOGLE_REVIEW_URL,
+      instagramUrl:
+        INSTAGRAM_URL,
+      facebookUrl:
+        FACEBOOK_URL
+    };
+
+    try {
+      await databaseReady;
+
+      links =
+        await getLinks();
+
+      const summary =
+        await syncGoogleReviews();
+
+      if (
+        typeof summary?.rating ===
+        "number"
+      ) {
+        rating =
+          summary.rating.toFixed(1);
+
+        count =
+          summary.count ?? null;
+      }
+    } catch (e) {
+      console.log(
+        `Config Error: ${e.message}`
+      );
+    }
+
+    response.json({
+      googleReviewUrl:
+        links.googleReviewUrl ||
+        null,
+
+      instagramUrl:
+        links.instagramUrl ||
+        null,
+
+      facebookUrl:
+        links.facebookUrl ||
+        null,
+
+      googleRating:
+        rating || null,
+
+      googleReviewCount:
+        count
+    });
+  }
+);
+
+// --------------------------------------------------
+// WAIT FOR DATABASE
+// --------------------------------------------------
+
+app.use(
+  async (
+    request,
+    response,
+    next
+  ) => {
+    try {
+      await databaseReady;
+      next();
+    } catch (e) {
+      console.log(
+        `DB Error: ${e.message}`
+      );
+
+      response
+        .status(500)
+        .json({
+          error:
+            "Database not available. Check the MySQL settings."
+        });
+    }
+  }
+);
+
+// --------------------------------------------------
+// REVIEWS
+// --------------------------------------------------
+
+app.get(
+  "/api/reviews",
+  async (
+    request,
+    response
+  ) => {
+    try {
+      await syncGoogleReviews();
+
+      const summaries =
+        await getSetting(
+          "googleSummary"
+        );
+
+      const rows =
+        await query(
+          `
+            SELECT
+              author,
+              stars,
+              text,
+              publishedAt
+            FROM reviews
+            ORDER BY publishedAt DESC
+            LIMIT 50
+          `
+        );
+
+      response.json({
+        rating:
+          summaries?.rating ??
+          null,
+
+        count:
+          summaries?.count ??
+          0,
+
+        updatedAt:
+          summaries?.fetchedAt
+            ? toIso(
+              summaries.fetchedAt
+            )
+            : null,
+
+        reviews:
+          rows.map((r) => ({
+            author: r.author,
+            stars: r.stars,
+            text: r.text || "",
+            publishedAt:
+              r.publishedAt
+                ? toIso(
+                  r.publishedAt
+                )
+                : null
+          }))
+      });
+    } catch (e) {
+      console.log(
+        `Reviews Error: ${e.message}`
+      );
+
+      response
+        .status(500)
+        .json({
+          error:
+            "Could not load reviews."
+        });
+    }
+  }
+);
+
+// --------------------------------------------------
+// QR
+// --------------------------------------------------
+
+app.get(
+  "/qr.png",
+  async (
+    request,
+    response
+  ) => {
+    try {
+      const png =
+        await QRCode.toBuffer(
+          getScanUrl(),
+          {
+            width: 600,
+            margin: 2
+          }
+        );
+
+      response
+        .type("png")
+        .send(png);
+    } catch (e) {
+      response
+        .status(500)
+        .send(
+          "Could not create QR code"
+        );
+    }
+  }
+);
+
+app.get(
+  "/qr",
+  (
+    request,
+    response
+  ) => {
+    response.send(`
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport"
+          content="width=device-width, initial-scale=1">
+        <title>Scan to open</title>
+      </head>
+      <body
+        style="font-family:sans-serif;text-align:center;padding:2rem"
+      >
+        <h1>Scan to open</h1>
+
+        <img
+          src="/qr.png"
+          alt="QR code"
+          width="300"
+          height="300"
+        >
+
+        <p>${getScanUrl()}</p>
+      </body>
+      </html>
+    `);
+  }
+);
+
+// --------------------------------------------------
+// SCAN
+// --------------------------------------------------
+
+app.get(
+  "/scan",
+  async (
+    request,
+    response
+  ) => {
+    response.set(
+      "Cache-Control",
+      "no-store"
+    );
+
+    let counted = false;
+
+    try {
+      const user =
+        await getUserFromRequest(
+          request
+        );
+
+      if (user) {
+        counted =
+          await addVisit(
+            user.id
+          );
+      }
+    } catch (e) {
+      console.log(
+        `Scan Error: ${e.message}`
+      );
+    }
+
+    response.redirect(
+      counted
+        ? "/?counted=1"
+        : "/"
+    );
+  }
+);
+
+// --------------------------------------------------
+// STATIC FILES
+// --------------------------------------------------
+
+app.use(
+  express.static(
+    path.join(
+      __dirname,
+      "public"
+    )
+  )
+);
+
+// --------------------------------------------------
+// EMAIL LOGIN
+// --------------------------------------------------
+
+app.post(
+  "/api/login",
+  async (
+    request,
+    response
+  ) => {
+    const email =
+      String(
+        request.body?.email ?? ""
+      )
+        .trim()
+        .toLowerCase();
+
+    if (
+      !email ||
+      email.length > 254 ||
+      !EMAIL_PATTERN.test(email)
+    ) {
+      return response
+        .status(400)
+        .json({
+          error:
+            "Enter a valid email address."
+        });
+    }
+
+    try {
+      response.json(
+        await signInUser(
+          request,
+          response,
+          email
+        )
+      );
+    } catch (e) {
+      console.log(
+        `Login Error: ${e.message}`
+      );
+
+      response
+        .status(500)
+        .json({
+          error:
+            "Could not save your email. Try again."
+        });
+    }
+  }
+);
+
+// --------------------------------------------------
+// GOOGLE LOGIN
+// --------------------------------------------------
+
+app.post(
+  "/api/google-login",
+  async (
+    request,
+    response
+  ) => {
+    try {
+      const credential =
+        String(
+          request.body?.credential ??
+          ""
+        );
+
+      if (!credential) {
+        return response
+          .status(400)
+          .json({
+            error:
+              "Missing Google sign-in."
+          });
+      }
+
+      const ticket =
+        await googleClient.verifyIdToken(
+          {
+            idToken:
+              credential,
+            audience:
+              process.env
+                .GOOGLE_CLIENT_ID
+          }
+        );
+
+      const payload =
+        ticket.getPayload();
+
+      if (
+        !payload?.email ||
+        !payload.email_verified
+      ) {
+        return response
+          .status(400)
+          .json({
+            error:
+              "Your Google email is not verified."
+          });
+      }
+
+      const email =
+        payload.email
+          .trim()
+          .toLowerCase();
+
+      response.json({
+        ...(await signInUser(
+          request,
+          response,
+          email
+        )),
+
+        name:
+          payload.name
+      });
+    } catch (e) {
+      console.error(
+        `Google Login Error:`,
+        e
+      );
+
+      response
+        .status(401)
+        .json({
+          error:
+            `Google sign-in failed: ${e.message || "Unknown error"}`
+        });
+    }
+  }
+);
+
+// --------------------------------------------------
+// CURRENT USER
+// --------------------------------------------------
+
+app.get(
+  "/api/me",
+  async (
+    request,
+    response
+  ) => {
+    try {
+      const user =
+        await getUserFromRequest(
+          request
+        );
+
+      if (!user) {
+        response.clearCookie(
+          COOKIE_NAME
+        );
+
+        return response
+          .status(401)
+          .json({
+            error:
+              "Not signed in.",
+
+            offers:
+              buildOffers(
+                0,
+                new Map(),
+                await getOffers()
+              ).offers
+          });
+      }
+
+      response.json(
+        await getStatus(
+          user.id
+        )
+      );
+    } catch (e) {
+      console.log(
+        `Me Error: ${e.message}`
+      );
+
+      response
+        .status(500)
+        .json({
+          error:
+            "Something went wrong. Try again."
+        });
+    }
+  }
+);
+
+// --------------------------------------------------
+// CLAIM
+// --------------------------------------------------
+
+app.post(
+  "/api/claim",
+  async (
+    request,
+    response
+  ) => {
+    try {
+      const user =
+        await getUserFromRequest(
+          request
+        );
+
+      if (!user) {
+        return response
+          .status(401)
+          .json({
+            error:
+              "Please sign in first."
+          });
+      }
+
+      const minVisits =
+        Number(
+          request.body?.minVisits
+        );
+
+      const offerList =
+        await getOffers();
+
+      const offer =
+        offerList.find(
+          (item) =>
+            Number(
+              item.minVisits
+            ) === minVisits
+        );
+
+      if (!offer) {
+        return response
+          .status(400)
+          .json({
+            error:
+              "Unknown reward."
+          });
+      }
+
+      if (
+        Number(user.visitCount) <
+        offer.minVisits
+      ) {
+        return response
+          .status(400)
+          .json({
+            error:
+              "This reward is not unlocked yet."
+          });
+      }
+
+      const result =
+        await execute(
+          `
+            INSERT IGNORE INTO claims
+              (
+                userId,
+                minVisits,
+                claimedAt
+              )
+            VALUES (?, ?, ?)
+          `,
+          [
+            user.id,
+            offer.minVisits,
+            new Date()
+          ]
+        );
+
+      response.json({
+        ...(await getStatus(
+          user.id
+        )),
+
+        justClaimed:
+          result.affectedRows === 1
+      });
+    } catch (e) {
+      console.log(
+        `Claim Error: ${e.message}`
+      );
+
+      response
+        .status(500)
+        .json({
+          error:
+            "Could not claim the reward. Try again."
+        });
+    }
+  }
+);
+
+// --------------------------------------------------
+// LOGOUT
+// --------------------------------------------------
+
+app.post(
+  "/api/logout",
+  async (
+    request,
+    response
+  ) => {
+    const token =
+      getCookie(
+        request,
+        COOKIE_NAME
+      );
+
+    try {
+      if (token) {
+        await execute(
+          `
+            DELETE FROM sessions
+            WHERE tokenHash = ?
+          `,
+          [hashToken(token)]
+        );
+      }
+    } catch (e) {
+      console.log(
+        `Logout Error: ${e.message}`
+      );
+    }
+
+    response.clearCookie(
+      COOKIE_NAME
+    );
+
+    response.json({
+      ok: true
+    });
+  }
+);
+
+// --------------------------------------------------
+// DASHBOARD
+// --------------------------------------------------
+
+require("./dashboard")(
+  app,
+  {
+    getDb: () => ({
+      query,
+      execute,
+      pool
+    }),
+
+    getCookie,
+
+    getOffers,
+
+    defaultOffers:
+      DEFAULT_OFFERS,
+
+    toIso,
+
+    syncGoogleReviews,
+
+    getLinks
+  }
+);
+
+// --------------------------------------------------
+// START SERVER
+// --------------------------------------------------
+
 if (require.main === module) {
   databaseReady
     .then(() => {
-      const scanUrl = getScanUrl();
-      const isPublic = Boolean(getPublicUrl());
-      const server = app.listen(PORT, "0.0.0.0", async () => {
-        console.log(`Server Running at http://localhost:${PORT}/`);
-        console.log(
-          process.env.TURSO_DATABASE_URL
-            ? "Database: Turso/libSQL"
-            : `Database file: ${dbPath}`
-        );
-        console.log("");
-        console.log("Addresses on this computer:");
-        for (const address of getLanAddresses()) {
-          console.log(`  http://${address.address}:${PORT}   (${address.name})`);
-        }
-        console.log("");
-        try {
-          console.log(await QRCode.toString(scanUrl, { type: "terminal", small: true }));
-        } catch (error) {
-          console.log(`Could not draw QR code: ${error.message}`);
-        }
-        console.log(`QR code points to: ${scanUrl}`);
-        if (isPublic) {
-          console.log("A public URL is set, so this QR code works on mobile data too.");
-        } else {
-          console.log("No public URL is set, so this QR code works only on the same Wi-Fi.");
-          console.log("For mobile data, run a tunnel and set PUBLIC_URL to its https link.");
-        }
-        console.log(`1) Test on your phone first: ${getBaseUrl()}/health   (should show OK)`);
-        console.log(`2) QR image page on your computer: http://localhost:${PORT}/qr`);
-        if (isPublic) {
-          console.log("3) Admin Dashboard:");
-          console.log(`   On this computer: http://localhost:${PORT}/dashboard`);
-          console.log(`   Online link:      ${getBaseUrl()}/dashboard`);
-        } else {
-          console.log(`3) Admin Dashboard: http://localhost:${PORT}/dashboard`);
-        }
-      });
+      const scanUrl =
+        getScanUrl();
 
-      server.on("error", (error) => {
-        console.error(`Server Error: ${error.message}`);
-        process.exit(1);
-      });
+      const isPublic =
+        Boolean(
+          getPublicUrl()
+        );
+
+      const server =
+        app.listen(
+          PORT,
+          "0.0.0.0",
+          async () => {
+            console.log(
+              `Server Running at http://localhost:${PORT}/`
+            );
+
+            console.log(
+              "Database: XAMPP MySQL / MariaDB"
+            );
+
+            console.log("");
+
+            console.log(
+              "Addresses on this computer:"
+            );
+
+            for (
+              const address of
+              getLanAddresses()
+            ) {
+              console.log(
+                `  http://${address.address}:${PORT} (${address.name})`
+              );
+            }
+
+            console.log("");
+
+            try {
+              console.log(
+                await QRCode.toString(
+                  scanUrl,
+                  {
+                    type: "terminal",
+                    small: true
+                  }
+                )
+              );
+            } catch (error) {
+              console.log(
+                `Could not draw QR code: ${error.message}`
+              );
+            }
+
+            console.log(
+              `QR code points to: ${scanUrl}`
+            );
+
+            if (isPublic) {
+              console.log(
+                "A public URL is set, so this QR code works on mobile data too."
+              );
+            } else {
+              console.log(
+                "No public URL is set, so this QR code works only on the same Wi-Fi."
+              );
+
+              console.log(
+                "For mobile data, run a tunnel and set PUBLIC_URL to its https link."
+              );
+            }
+
+            console.log(
+              `1) Test: ${getBaseUrl()}/health`
+            );
+
+            console.log(
+              `2) QR: http://localhost:${PORT}/qr`
+            );
+
+            console.log(
+              `3) Dashboard: http://localhost:${PORT}/dashboard`
+            );
+          }
+        );
+
+      server.on(
+        "error",
+        (error) => {
+          console.error(
+            `Server Error: ${error.message}`
+          );
+
+          process.exit(1);
+        }
+      );
     })
     .catch((error) => {
-      console.error(`DB Error: ${error.message}`);
+      console.error(
+        `DB Error: ${error.message}`
+      );
+
       process.exit(1);
     });
 }

@@ -1,228 +1,1470 @@
-// dashboard.js - the mart owner's dashboard.
-// server.js loads this file with ONE line (see Step 3).
+// dashboard.js - MySQL/MariaDB version
+
 const crypto = require("crypto");
 
-module.exports = function addDashboard(app, { getDb, getCookie, OFFERS, toIso }) {
-  const DASHBOARD_USERNAME = process.env.DASHBOARD_USERNAME || "admin";
-  const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "admin123";
+module.exports = function addDashboard(
+  app,
+  {
+    getDb,
+    getCookie,
+    getOffers,
+    defaultOffers,
+    toIso,
+    syncGoogleReviews,
+    getLinks
+  }
+) {
+  const DASHBOARD_USERNAME =
+    process.env.DASHBOARD_USERNAME ||
+    "admin";
 
-  // Minutes your timezone is ahead of UTC. India = 330. Used to decide what "today" means.
-  const DASHBOARD_UTC_OFFSET = Number(process.env.DASHBOARD_UTC_OFFSET_MINUTES ?? 330);
+  const DASHBOARD_PASSWORD =
+    process.env.DASHBOARD_PASSWORD ||
+    "admin123";
 
-  const ADMIN_COOKIE = "mart_admin";
+  const DASHBOARD_UTC_OFFSET =
+    Number(
+      process.env
+        .DASHBOARD_UTC_OFFSET_MINUTES ??
+      330
+    );
 
-  // The cookie value that proves "this browser typed the right credentials"
-  const ADMIN_TOKEN = crypto
-    .createHash("sha256")
-    .update(`mart-admin:${DASHBOARD_USERNAME}:${DASHBOARD_PASSWORD}`)
-    .digest("hex");
+  const ADMIN_COOKIE =
+    "mart_admin";
 
-  // Compares two texts safely (takes the same time whether they match or not)
+  // ------------------------------------------------
+  // ADMIN TOKEN
+  // ------------------------------------------------
+
+  const ADMIN_TOKEN =
+    crypto
+      .createHash("sha256")
+      .update(
+        `mart-admin:${DASHBOARD_USERNAME}:${DASHBOARD_PASSWORD}`
+      )
+      .digest("hex");
+
   const sameText = (a, b) => {
-    const first = Buffer.from(String(a));
-    const second = Buffer.from(String(b));
-    return first.length === second.length && crypto.timingSafeEqual(first, second);
+    const x = Buffer.from(
+      String(a)
+    );
+
+    const y = Buffer.from(
+      String(b)
+    );
+
+    return (
+      x.length === y.length &&
+      crypto.timingSafeEqual(
+        x,
+        y
+      )
+    );
   };
 
-  // Is this request from a signed-in owner?
-  const isAdmin = (request) =>
-    sameText(getCookie(request, ADMIN_COOKIE) || "", ADMIN_TOKEN);
+  const isAdmin = (req) =>
+    sameText(
+      getCookie(
+        req,
+        ADMIN_COOKIE
+      ) || "",
+      ADMIN_TOKEN
+    );
 
-  // Database helpers that work with both the SQLite and the Turso version
-  const adminAll = async (sql, args = []) => {
-    const db = getDb();
-    if (typeof db.all === "function") return db.all(sql, args); // sqlite package
-    return (await db.execute({ sql, args })).rows;               // Turso client
+  // ------------------------------------------------
+  // DATE
+  // ------------------------------------------------
+
+  const startOfToday = () => {
+    const off =
+      DASHBOARD_UTC_OFFSET *
+      60 *
+      1000;
+
+    const local =
+      new Date(
+        Date.now() + off
+      );
+
+    return new Date(
+      Date.UTC(
+        local.getUTCFullYear(),
+        local.getUTCMonth(),
+        local.getUTCDate()
+      ) - off
+    );
   };
-  const adminOne = async (sql, args = []) => (await adminAll(sql, args))[0] || null;
 
-  // Never let the browser keep a copy of dashboard data
-  app.use("/admin", (request, response, next) => {
-    response.set("Cache-Control", "no-store");
-    next();
-  });
+  // ------------------------------------------------
+  // CLAIM COUNTS
+  // ------------------------------------------------
 
-  // Short link: /dashboard opens the dashboard page
-  app.get("/dashboard", (request, response) => response.redirect("/dashboard.html"));
+  const getClaimCounts =
+    async (db) => {
+      const rows =
+        await db.query(`
+          SELECT
+            userId,
+            COUNT(*) AS n
+          FROM claims
+          GROUP BY userId
+        `);
 
-  // --- Sign in with Username and Password ---
-  app.post("/admin/login", (request, response) => {
-    const inputUsername = String(request.body?.username ?? "").trim();
-    const inputPassword = String(request.body?.password ?? "");
+      return new Map(
+        rows.map((r) => [
+          String(r.userId),
+          Number(r.n)
+        ])
+      );
+    };
 
-    if (!inputUsername || !inputPassword) {
-      return response
-        .status(400)
-        .json({ error: "Please enter both username and password." });
-    }
+  // ------------------------------------------------
+  // ADMIN CACHE
+  // ------------------------------------------------
 
-    const validUsername = sameText(inputUsername, DASHBOARD_USERNAME);
-    const validPassword = sameText(inputPassword, DASHBOARD_PASSWORD);
-
-    if (!validUsername || !validPassword) {
-      return response.status(401).json({ error: "Invalid username or password." });
-    }
-
-    response.cookie(ADMIN_COOKIE, ADMIN_TOKEN, {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: request.secure,
-      maxAge: 12 * 60 * 60 * 1000, // stays signed in for 12 hours
-    });
-    response.json({ ok: true, username: DASHBOARD_USERNAME });
-  });
-
-  // --- Sign out ---
-  app.post("/admin/logout", (request, response) => {
-    response.clearCookie(ADMIN_COOKIE);
-    response.json({ ok: true });
-  });
-
-  // --- All the numbers for the dashboard ---
-  app.get("/admin/data", async (request, response) => {
-    if (!isAdmin(request)) {
-      return response.status(401).json({ error: "Please sign in." });
-    }
-
-    try {
-      // Turns 330 into "+330 minutes" so SQLite can shift UTC times to your local day
-      const shift = `${DASHBOARD_UTC_OFFSET >= 0 ? "+" : ""}${DASHBOARD_UTC_OFFSET} minutes`;
-
-      // 1) The cards at the top
-      const totals = await adminOne(
-        `SELECT
-           COUNT(*) AS customers,
-           COALESCE(SUM(visit_count), 0) AS totalVisits,
-           COALESCE(SUM(CASE WHEN date(created_at, ?) = date('now', ?) THEN 1 ELSE 0 END), 0) AS newToday,
-           COALESCE(SUM(CASE WHEN last_visit_at IS NOT NULL
-                             AND date(last_visit_at, ?) = date('now', ?) THEN 1 ELSE 0 END), 0) AS visitedToday,
-           COALESCE(SUM(CASE WHEN last_visit_at IS NOT NULL
-                             AND last_visit_at >= datetime('now', '-7 days') THEN 1 ELSE 0 END), 0) AS visited7Days
-         FROM users`,
-        [shift, shift, shift, shift]
+  app.use(
+    "/admin",
+    (
+      req,
+      res,
+      next
+    ) => {
+      res.set(
+        "Cache-Control",
+        "no-store"
       );
 
-      const claimTotals = await adminOne(
-        `SELECT
-           COUNT(*) AS claimed,
-           COALESCE(SUM(CASE WHEN date(claimed_at, ?) = date('now', ?) THEN 1 ELSE 0 END), 0) AS claimedToday
-         FROM claims`,
-        [shift, shift]
+      next();
+    }
+  );
+
+  // ------------------------------------------------
+  // DASHBOARD PAGES
+  // ------------------------------------------------
+
+  app.get(
+    "/dashboard",
+    (
+      req,
+      res
+    ) =>
+      res.redirect(
+        "/dashboard.html"
+      )
+  );
+
+  app.get(
+    "/dashboard/offers",
+    (
+      req,
+      res
+    ) =>
+      res.redirect(
+        "/offers-admin.html"
+      )
+  );
+
+  // ------------------------------------------------
+  // ADMIN LOGIN
+  // ------------------------------------------------
+
+  app.post(
+    "/admin/login",
+    (
+      req,
+      res
+    ) => {
+      const u =
+        String(
+          req.body?.username ??
+          ""
+        ).trim();
+
+      const p =
+        String(
+          req.body?.password ??
+          ""
+        );
+
+      if (!u || !p) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "Please enter both username and password."
+          });
+      }
+
+      if (
+        !sameText(
+          u,
+          DASHBOARD_USERNAME
+        ) ||
+        !sameText(
+          p,
+          DASHBOARD_PASSWORD
+        )
+      ) {
+        return res
+          .status(401)
+          .json({
+            error:
+              "Invalid username or password."
+          });
+      }
+
+      res.cookie(
+        ADMIN_COOKIE,
+        ADMIN_TOKEN,
+        {
+          httpOnly: true,
+          sameSite: "lax",
+          secure: req.secure,
+          maxAge:
+            12 *
+            60 *
+            60 *
+            1000
+        }
       );
 
-      // 2) One row per reward: how many unlocked it, how many claimed it
-      const offers = [];
-      for (const offer of OFFERS) {
-        const unlocked = await adminOne(
-          "SELECT COUNT(*) AS n FROM users WHERE visit_count >= ?",
-          [offer.minVisits]
+      res.json({
+        ok: true,
+        username:
+          DASHBOARD_USERNAME
+      });
+    }
+  );
+
+  // ------------------------------------------------
+  // ADMIN LOGOUT
+  // ------------------------------------------------
+
+  app.post(
+    "/admin/logout",
+    (
+      req,
+      res
+    ) => {
+      res.clearCookie(
+        ADMIN_COOKIE
+      );
+
+      res.json({
+        ok: true
+      });
+    }
+  );
+
+  // ------------------------------------------------
+  // CLEAN OFFERS
+  // ------------------------------------------------
+
+  const cleanOffers =
+    (input) => {
+      if (
+        !Array.isArray(input) ||
+        input.length === 0
+      ) {
+        throw new Error(
+          "Add at least one offer."
         );
-        const claimed = await adminOne(
-          "SELECT COUNT(*) AS n FROM claims WHERE min_visits = ?",
-          [offer.minVisits]
+      }
+
+      if (input.length > 20) {
+        throw new Error(
+          "You can have at most 20 offers."
         );
-        offers.push({
-          minVisits: offer.minVisits,
-          headline: offer.headline,
-          unlocked: Number(unlocked.n),
-          claimed: Number(claimed.n),
+      }
+
+      const seen =
+        new Set();
+
+      const cleaned =
+        input.map(
+          (item, i) => {
+            const n = i + 1;
+
+            const minVisits =
+              Number(
+                item?.minVisits
+              );
+
+            const icon =
+              String(
+                item?.icon ?? ""
+              )
+                .trim()
+                .slice(0, 8);
+
+            const headline =
+              String(
+                item?.headline ??
+                ""
+              ).trim();
+
+            const text =
+              String(
+                item?.text ?? ""
+              ).trim();
+
+            if (
+              !Number.isInteger(
+                minVisits
+              ) ||
+              minVisits < 1 ||
+              minVisits > 1000
+            ) {
+              throw new Error(
+                `Offer ${n}: visits must be a whole number from 1 to 1000.`
+              );
+            }
+
+            if (
+              seen.has(minVisits)
+            ) {
+              throw new Error(
+                `Offer ${n}: another offer already uses ${minVisits} visits.`
+              );
+            }
+
+            seen.add(
+              minVisits
+            );
+
+            if (
+              !headline ||
+              headline.length > 60
+            ) {
+              throw new Error(
+                `Offer ${n}: the title must be 1 to 60 characters.`
+              );
+            }
+
+            if (
+              !text ||
+              text.length > 200
+            ) {
+              throw new Error(
+                `Offer ${n}: the message must be 1 to 200 characters.`
+              );
+            }
+
+            return {
+              minVisits,
+              icon:
+                icon || "🎁",
+              headline,
+              text
+            };
+          }
+        );
+
+      return cleaned.sort(
+        (a, b) =>
+          a.minVisits -
+          b.minVisits
+      );
+    };
+
+  // ------------------------------------------------
+  // GET OFFERS
+  // ------------------------------------------------
+
+  app.get(
+    "/admin/offers",
+    async (
+      req,
+      res
+    ) => {
+      if (!isAdmin(req)) {
+        return res
+          .status(401)
+          .json({
+            error:
+              "Please sign in."
+          });
+      }
+
+      try {
+        res.json({
+          offers:
+            await getOffers()
         });
+      } catch (e) {
+        console.log(
+          `Offers Error: ${e.message}`
+        );
+
+        res
+          .status(500)
+          .json({
+            error:
+              "Could not load the offers."
+          });
+      }
+    }
+  );
+
+  // ------------------------------------------------
+  // SAVE OFFERS
+  // ------------------------------------------------
+
+  app.put(
+    "/admin/offers",
+    async (
+      req,
+      res
+    ) => {
+      if (!isAdmin(req)) {
+        return res
+          .status(401)
+          .json({
+            error:
+              "Please sign in."
+          });
       }
 
-      // 3) The customers table (most visits first)
-      const customerRows = await adminAll(
-        `SELECT u.email,
-                u.visit_count AS visits,
-                u.created_at AS joined,
-                u.last_visit_at AS lastVisit,
-                (SELECT COUNT(*) FROM claims c WHERE c.user_id = u.id) AS claimed
-         FROM users u
-         ORDER BY u.visit_count DESC, u.last_visit_at DESC
-         LIMIT 1000`
-      );
-      const customers = customerRows.map((row) => ({
-        email: row.email,
-        visits: Number(row.visits),
-        claimed: Number(row.claimed),
-        joined: toIso(row.joined),
-        lastVisit: row.lastVisit ? toIso(row.lastVisit) : null,
-      }));
+      let offers;
 
-      // 4) The 20 most recent claims
-      const claimRows = await adminAll(
-        `SELECT u.email, c.min_visits AS minVisits, c.claimed_at AS claimedAt
-         FROM claims c
-         JOIN users u ON u.id = c.user_id
-         ORDER BY c.claimed_at DESC
-         LIMIT 20`
-      );
-      const recentClaims = claimRows.map((row) => {
-        const offer = OFFERS.find((item) => item.minVisits === Number(row.minVisits));
-        return {
-          email: row.email,
-          reward: offer ? offer.headline : `${row.minVisits} visits`,
-          claimedAt: toIso(row.claimedAt),
-        };
-      });
+      try {
+        offers =
+          cleanOffers(
+            req.body?.offers
+          );
+      } catch (e) {
+        return res
+          .status(400)
+          .json({
+            error:
+              e.message
+          });
+      }
 
-      response.json({
-        adminUser: DASHBOARD_USERNAME,
-        summary: {
-          customers: Number(totals.customers),
-          totalVisits: Number(totals.totalVisits),
-          newToday: Number(totals.newToday),
-          visitedToday: Number(totals.visitedToday),
-          visited7Days: Number(totals.visited7Days),
-          claimed: Number(claimTotals.claimed),
-          claimedToday: Number(claimTotals.claimedToday),
-        },
-        offers,
-        customers,
-        recentClaims,
-      });
-    } catch (e) {
-      console.log(`Dashboard Error: ${e.message}`);
-      response.status(500).json({ error: "Could not load the dashboard data." });
+      try {
+        const db =
+          getDb();
+
+        await db.query(
+          `
+            INSERT INTO settings
+              (
+                settingKey,
+                settingValue,
+                updatedAt
+              )
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON DUPLICATE KEY UPDATE
+              settingValue = VALUES(settingValue),
+              updatedAt = CURRENT_TIMESTAMP
+          `,
+          [
+            "offers",
+            JSON.stringify(
+              offers
+            )
+          ]
+        );
+
+        res.json({
+          ok: true,
+          offers
+        });
+      } catch (e) {
+        console.log(
+          `Offers Save Error: ${e.message}`
+        );
+
+        res
+          .status(500)
+          .json({
+            error:
+              "Could not save the offers."
+          });
+      }
     }
-  });
+  );
 
-  // --- Download all customers as a CSV file (opens in Excel) ---
-  app.get("/admin/export.csv", async (request, response) => {
-    if (!isAdmin(request)) {
-      return response.status(401).send("Please sign in on the dashboard first.");
+  // ------------------------------------------------
+  // RESET OFFERS
+  // ------------------------------------------------
+
+  app.post(
+    "/admin/offers/reset",
+    async (
+      req,
+      res
+    ) => {
+      if (!isAdmin(req)) {
+        return res
+          .status(401)
+          .json({
+            error:
+              "Please sign in."
+          });
+      }
+
+      try {
+        const db =
+          getDb();
+
+        await db.query(
+          `
+            DELETE FROM settings
+            WHERE settingKey = ?
+          `,
+          ["offers"]
+        );
+
+        res.json({
+          ok: true,
+          offers:
+            defaultOffers
+        });
+      } catch (e) {
+        console.log(
+          `Offers Reset Error: ${e.message}`
+        );
+
+        res
+          .status(500)
+          .json({
+            error:
+              "Could not reset the offers."
+          });
+      }
     }
+  );
 
-    try {
-      const rows = await adminAll(
-        `SELECT u.email,
-                u.visit_count AS visits,
-                u.created_at AS joined,
-                u.last_visit_at AS lastVisit,
-                (SELECT COUNT(*) FROM claims c WHERE c.user_id = u.id) AS claimed
-         FROM users u
-         ORDER BY u.visit_count DESC`
-      );
+  // ------------------------------------------------
+  // LINKS
+  // ------------------------------------------------
 
-      // Wrap each value in quotes. A leading ' stops Excel from running anything like =1+1
-      const cell = (value) => {
-        let text = String(value ?? "");
-        if (/^[=+\-@]/.test(text)) text = `'${text}`;
-        return `"${text.replace(/"/g, '""')}"`;
-      };
+  const cleanLink =
+    (
+      value,
+      label,
+      hosts
+    ) => {
+      const text =
+        String(
+          value ?? ""
+        ).trim();
 
-      const lines = ["Email,Visits,Rewards claimed,Last visit (UTC),Joined (UTC)"];
-      for (const row of rows) {
-        lines.push(
-          [row.email, row.visits, row.claimed, row.lastVisit, row.joined].map(cell).join(",")
+      if (!text) {
+        return "";
+      }
+
+      if (text.length > 300) {
+        throw new Error(
+          `${label}: the link is too long.`
         );
       }
 
-      response.set("Content-Type", "text/csv; charset=utf-8");
-      response.set("Content-Disposition", 'attachment; filename="mart-customers.csv"');
-      response.send(lines.join("\r\n"));
-    } catch (e) {
-      console.log(`Export Error: ${e.message}`);
-      response.status(500).send("Could not create the file.");
+      let url;
+
+      try {
+        url = new URL(
+          text
+        );
+      } catch {
+        throw new Error(
+          `${label}: enter a full link starting with https://`
+        );
+      }
+
+      if (
+        url.protocol !==
+        "https:"
+      ) {
+        throw new Error(
+          `${label}: the link must start with https://`
+        );
+      }
+
+      if (
+        hosts &&
+        !hosts.some(
+          (h) =>
+            url.hostname === h ||
+            url.hostname.endsWith(
+              `.${h}`
+            )
+        )
+      ) {
+        throw new Error(
+          `${label}: the link must be on ${hosts.join(
+            " or "
+          )}.`
+        );
+      }
+
+      return url.toString();
+    };
+
+  // ------------------------------------------------
+  // GET LINKS
+  // ------------------------------------------------
+
+  app.get(
+    "/admin/links",
+    async (
+      req,
+      res
+    ) => {
+      if (!isAdmin(req)) {
+        return res
+          .status(401)
+          .json({
+            error:
+              "Please sign in."
+          });
+      }
+
+      try {
+        res.json(
+          await getLinks()
+        );
+      } catch (e) {
+        console.log(
+          `Links Error: ${e.message}`
+        );
+
+        res
+          .status(500)
+          .json({
+            error:
+              "Could not load the links."
+          });
+      }
     }
-  });
+  );
+
+  // ------------------------------------------------
+  // SAVE LINKS
+  // ------------------------------------------------
+
+  app.put(
+    "/admin/links",
+    async (
+      req,
+      res
+    ) => {
+      if (!isAdmin(req)) {
+        return res
+          .status(401)
+          .json({
+            error:
+              "Please sign in."
+          });
+      }
+
+      let links;
+
+      try {
+        links = {
+          instagramUrl:
+            cleanLink(
+              req.body?.instagramUrl,
+              "Instagram",
+              ["instagram.com"]
+            ),
+
+          facebookUrl:
+            cleanLink(
+              req.body?.facebookUrl,
+              "Facebook",
+              [
+                "facebook.com",
+                "fb.com",
+                "fb.me"
+              ]
+            ),
+
+          googleReviewUrl:
+            cleanLink(
+              req.body?.googleReviewUrl,
+              "Google review",
+              null
+            )
+        };
+      } catch (e) {
+        return res
+          .status(400)
+          .json({
+            error:
+              e.message
+          });
+      }
+
+      try {
+        const db =
+          getDb();
+
+        await db.query(
+          `
+            INSERT INTO settings
+              (
+                settingKey,
+                settingValue,
+                updatedAt
+              )
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON DUPLICATE KEY UPDATE
+              settingValue = VALUES(settingValue),
+              updatedAt = CURRENT_TIMESTAMP
+          `,
+          [
+            "links",
+            JSON.stringify(
+              links
+            )
+          ]
+        );
+
+        res.json({
+          ok: true,
+          ...links
+        });
+      } catch (e) {
+        console.log(
+          `Links Save Error: ${e.message}`
+        );
+
+        res
+          .status(500)
+          .json({
+            error:
+              "Could not save the links."
+          });
+      }
+    }
+  );
+
+  // ------------------------------------------------
+  // DASHBOARD DATA
+  // ------------------------------------------------
+
+  app.get(
+    "/admin/data",
+    async (
+      req,
+      res
+    ) => {
+      if (!isAdmin(req)) {
+        return res
+          .status(401)
+          .json({
+            error:
+              "Please sign in."
+          });
+      }
+
+      try {
+        const db =
+          getDb();
+
+        const OFFERS =
+          await getOffers();
+
+        const todayStart =
+          startOfToday();
+
+        const sevenDaysAgo =
+          new Date(
+            Date.now() -
+            7 *
+            24 *
+            60 *
+            60 *
+            1000
+          );
+
+        // --------------------------------------------
+        // SUMMARY
+        // --------------------------------------------
+
+        const [
+          customersRows,
+          visitsRows,
+          newTodayRows,
+          visitedTodayRows,
+          visited7DaysRows,
+          claimedRows,
+          claimedTodayRows
+        ] =
+          await Promise.all([
+            db.query(`
+              SELECT COUNT(*) AS n
+              FROM users
+            `),
+
+            db.query(`
+              SELECT COALESCE(
+                SUM(visitCount),
+                0
+              ) AS total
+              FROM users
+            `),
+
+            db.query(
+              `
+                SELECT COUNT(*) AS n
+                FROM users
+                WHERE createdAt >= ?
+              `,
+              [todayStart]
+            ),
+
+            db.query(
+              `
+                SELECT COUNT(*) AS n
+                FROM users
+                WHERE lastVisitAt >= ?
+              `,
+              [todayStart]
+            ),
+
+            db.query(
+              `
+                SELECT COUNT(*) AS n
+                FROM users
+                WHERE lastVisitAt >= ?
+              `,
+              [sevenDaysAgo]
+            ),
+
+            db.query(`
+              SELECT COUNT(*) AS n
+              FROM claims
+            `),
+
+            db.query(
+              `
+                SELECT COUNT(*) AS n
+                FROM claims
+                WHERE claimedAt >= ?
+              `,
+              [todayStart]
+            )
+          ]);
+
+        const customers =
+          Number(
+            customersRows[0].n
+          );
+
+        const totalVisits =
+          Number(
+            visitsRows[0].total
+          );
+
+        const newToday =
+          Number(
+            newTodayRows[0].n
+          );
+
+        const visitedToday =
+          Number(
+            visitedTodayRows[0].n
+          );
+
+        const visited7Days =
+          Number(
+            visited7DaysRows[0].n
+          );
+
+        const claimed =
+          Number(
+            claimedRows[0].n
+          );
+
+        const claimedToday =
+          Number(
+            claimedTodayRows[0].n
+          );
+
+        // --------------------------------------------
+        // OFFERS
+        // --------------------------------------------
+
+        const offers = [];
+
+        for (
+          const o of OFFERS
+        ) {
+          const [
+            unlockedRows,
+            claimedCountRows
+          ] =
+            await Promise.all([
+              db.query(
+                `
+                  SELECT COUNT(*) AS n
+                  FROM users
+                  WHERE visitCount >= ?
+                `,
+                [o.minVisits]
+              ),
+
+              db.query(
+                `
+                  SELECT COUNT(*) AS n
+                  FROM claims
+                  WHERE minVisits = ?
+                `,
+                [o.minVisits]
+              )
+            ]);
+
+          offers.push({
+            minVisits:
+              o.minVisits,
+
+            headline:
+              o.headline,
+
+            unlocked:
+              Number(
+                unlockedRows[0].n
+              ),
+
+            claimed:
+              Number(
+                claimedCountRows[0].n
+              )
+          });
+        }
+
+        // --------------------------------------------
+        // CUSTOMERS
+        // --------------------------------------------
+
+        const claimCounts =
+          await getClaimCounts(
+            db
+          );
+
+        const rows =
+          await db.query(`
+            SELECT
+              id,
+              email,
+              visitCount,
+              createdAt,
+              lastVisitAt
+            FROM users
+            ORDER BY
+              visitCount DESC,
+              lastVisitAt DESC
+            LIMIT 1000
+          `);
+
+        const customerList =
+          rows.map((r) => ({
+            email: r.email,
+
+            visits:
+              Number(
+                r.visitCount
+              ),
+
+            claimed:
+              claimCounts.get(
+                String(r.id)
+              ) || 0,
+
+            joined:
+              toIso(
+                r.createdAt
+              ),
+
+            lastVisit:
+              r.lastVisitAt
+                ? toIso(
+                  r.lastVisitAt
+                )
+                : null
+          }));
+
+        // --------------------------------------------
+        // RECENT CLAIMS
+        // --------------------------------------------
+
+        const claimRows =
+          await db.query(`
+            SELECT
+              c.id,
+              c.userId,
+              c.minVisits,
+              c.claimedAt,
+              u.email
+            FROM claims c
+            LEFT JOIN users u
+              ON u.id = c.userId
+            ORDER BY
+              c.claimedAt DESC
+            LIMIT 20
+          `);
+
+        const recentClaims =
+          claimRows.map(
+            (r) => {
+              const o =
+                OFFERS.find(
+                  (x) =>
+                    Number(
+                      x.minVisits
+                    ) ===
+                    Number(
+                      r.minVisits
+                    )
+                );
+
+              return {
+                email:
+                  r.email ||
+                  "(deleted user)",
+
+                reward:
+                  o
+                    ? o.headline
+                    : `${r.minVisits} visits`,
+
+                claimedAt:
+                  toIso(
+                    r.claimedAt
+                  )
+              };
+            }
+          );
+
+        // --------------------------------------------
+        // GOOGLE REVIEWS
+        // --------------------------------------------
+
+        try {
+          if (syncGoogleReviews) {
+            await syncGoogleReviews(
+              req.query
+                .refreshReviews ===
+              "1"
+            );
+          }
+        } catch (e) {
+          console.log(
+            `Reviews Sync Error: ${e.message}`
+          );
+        }
+
+        const summaryRows =
+          await db.query(
+            `
+              SELECT settingValue
+              FROM settings
+              WHERE settingKey = ?
+              LIMIT 1
+            `,
+            ["googleSummary"]
+          );
+
+        let gSummary = null;
+
+        if (
+          summaryRows.length
+        ) {
+          try {
+            gSummary =
+              JSON.parse(
+                summaryRows[0]
+                  .settingValue
+              );
+          } catch {
+            gSummary = null;
+          }
+        }
+
+        const gRows =
+          await db.query(`
+            SELECT
+              author,
+              stars,
+              text,
+              publishedAt
+            FROM reviews
+            ORDER BY
+              publishedAt DESC
+            LIMIT 50
+          `);
+
+        const google = {
+          rating:
+            typeof gSummary?.rating ===
+              "number"
+              ? gSummary.rating
+              : null,
+
+          count:
+            gSummary?.count ??
+            0,
+
+          updatedAt:
+            gSummary?.fetchedAt
+              ? toIso(
+                gSummary.fetchedAt
+              )
+              : null,
+
+          reviews:
+            gRows.map(
+              (r) => ({
+                author:
+                  r.author,
+
+                stars:
+                  r.stars,
+
+                text:
+                  r.text || "",
+
+                publishedAt:
+                  r.publishedAt
+                    ? toIso(
+                      r.publishedAt
+                    )
+                    : null
+              })
+            )
+        };
+
+        // --------------------------------------------
+        // RESPONSE
+        // --------------------------------------------
+
+        res.json({
+          adminUser:
+            DASHBOARD_USERNAME,
+
+          summary: {
+            customers,
+            totalVisits,
+            newToday,
+            visitedToday,
+            visited7Days,
+            claimed,
+            claimedToday
+          },
+
+          offers,
+
+          customers:
+            customerList,
+
+          recentClaims,
+
+          google
+        });
+      } catch (e) {
+        console.log(
+          `Dashboard Error: ${e.message}`
+        );
+
+        res
+          .status(500)
+          .json({
+            error:
+              "Could not load the dashboard data."
+          });
+      }
+    }
+  );
+
+  // ------------------------------------------------
+  // CUSTOMER HISTORY
+  // ------------------------------------------------
+
+  app.get(
+    "/admin/customer",
+    async (
+      req,
+      res
+    ) => {
+      if (!isAdmin(req)) {
+        return res
+          .status(401)
+          .json({
+            error:
+              "Please sign in."
+          });
+      }
+
+      try {
+        const db =
+          getDb();
+
+        const email =
+          String(
+            req.query.email ||
+            ""
+          )
+            .trim()
+            .toLowerCase();
+
+        const users =
+          await db.query(
+            `
+              SELECT
+                id,
+                email,
+                createdAt,
+                lastVisitAt,
+                visitCount
+              FROM users
+              WHERE email = ?
+              LIMIT 1
+            `,
+            [email]
+          );
+
+        if (!users.length) {
+          return res
+            .status(404)
+            .json({
+              error:
+                "Customer not found."
+            });
+        }
+
+        const user =
+          users[0];
+
+        const OFFERS =
+          await getOffers();
+
+        const [
+          visits,
+          claims
+        ] =
+          await Promise.all([
+            db.query(
+              `
+                SELECT at
+                FROM visits
+                WHERE userId = ?
+                ORDER BY at ASC
+                LIMIT 2000
+              `,
+              [user.id]
+            ),
+
+            db.query(
+              `
+                SELECT
+                  minVisits,
+                  claimedAt
+                FROM claims
+                WHERE userId = ?
+                ORDER BY claimedAt ASC
+              `,
+              [user.id]
+            )
+          ]);
+
+        res.json({
+          email:
+            user.email,
+
+          joined:
+            toIso(
+              user.createdAt
+            ),
+
+          firstVisit:
+            visits[0]
+              ? toIso(
+                visits[0].at
+              )
+              : null,
+
+          lastVisit:
+            user.lastVisitAt
+              ? toIso(
+                user.lastVisitAt
+              )
+              : null,
+
+          totalVisits:
+            Number(
+              user.visitCount
+            ),
+
+          visits:
+            visits.map(
+              (v) =>
+                toIso(v.at)
+            ),
+
+          claims:
+            claims.map(
+              (c) => {
+                const o =
+                  OFFERS.find(
+                    (x) =>
+                      Number(
+                        x.minVisits
+                      ) ===
+                      Number(
+                        c.minVisits
+                      )
+                  );
+
+                return {
+                  reward:
+                    o
+                      ? o.headline
+                      : `${c.minVisits} visits`,
+
+                  claimedAt:
+                    toIso(
+                      c.claimedAt
+                    )
+                };
+              }
+            )
+        });
+      } catch (e) {
+        console.log(
+          `Customer Error: ${e.message}`
+        );
+
+        res
+          .status(500)
+          .json({
+            error:
+              "Could not load this customer."
+          });
+      }
+    }
+  );
+
+  // ------------------------------------------------
+  // CSV EXPORT
+  // ------------------------------------------------
+
+  app.get(
+    "/admin/export.csv",
+    async (
+      req,
+      res
+    ) => {
+      if (!isAdmin(req)) {
+        return res
+          .status(401)
+          .send(
+            "Please sign in on the dashboard first."
+          );
+      }
+
+      try {
+        const db =
+          getDb();
+
+        const claimCounts =
+          await getClaimCounts(
+            db
+          );
+
+        const rows =
+          await db.query(`
+            SELECT
+              email,
+              visitCount,
+              lastVisitAt,
+              createdAt,
+              id
+            FROM users
+            ORDER BY
+              visitCount DESC,
+              lastVisitAt DESC
+          `);
+
+        const cell =
+          (v) => {
+            let t =
+              String(
+                v ?? ""
+              );
+
+            if (
+              /^[=+\-@]/.test(
+                t
+              )
+            ) {
+              t = `'${t}`;
+            }
+
+            return `"${t.replace(
+              /"/g,
+              '""'
+            )}"`;
+          };
+
+        const lines = [
+          "Email,Visits,Rewards claimed,Last visit (UTC),Joined (UTC)"
+        ];
+
+        for (
+          const r of rows
+        ) {
+          lines.push(
+            [
+              r.email,
+
+              r.visitCount,
+
+              claimCounts.get(
+                String(r.id)
+              ) || 0,
+
+              r.lastVisitAt
+                ? toIso(
+                  r.lastVisitAt
+                )
+                : "",
+
+              toIso(
+                r.createdAt
+              )
+            ]
+              .map(cell)
+              .join(",")
+          );
+        }
+
+        res.set(
+          "Content-Type",
+          "text/csv; charset=utf-8"
+        );
+
+        res.set(
+          "Content-Disposition",
+          'attachment; filename="mart-customers.csv"'
+        );
+
+        res.send(
+          lines.join("\r\n")
+        );
+      } catch (e) {
+        console.log(
+          `Export Error: ${e.message}`
+        );
+
+        res
+          .status(500)
+          .send(
+            "Could not create the file."
+          );
+      }
+    }
+  );
 };

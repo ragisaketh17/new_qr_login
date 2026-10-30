@@ -2,58 +2,22 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
+const port = process.env.PORT || "3000";
 const projectRoot = __dirname;
 const projectEnvPath = path.join(projectRoot, ".env");
 
-// Load ALL variables from .env into process.env (so PUBLIC_URL, PORT, etc. are available)
 if (fs.existsSync(projectEnvPath)) {
-  const lines = fs.readFileSync(projectEnvPath, "utf8").split(/\r?\n/);
-  let projectPasswordIsSet = false;
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eqIdx = trimmed.indexOf("=");
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    const val = trimmed.slice(eqIdx + 1).trim().replace(/^['"](.*)['"]$/, "$1");
-    if (key === "DASHBOARD_PASSWORD") { projectPasswordIsSet = true; continue; }
-    if (!process.env[key]) process.env[key] = val; // don't override real env vars
-  }
+  const projectPasswordIsSet = fs
+    .readFileSync(projectEnvPath, "utf8")
+    .split(/\r?\n/)
+    .some((line) => /^\s*DASHBOARD_PASSWORD\s*=/.test(line));
+
   if (projectPasswordIsSet) {
     delete process.env.DASHBOARD_PASSWORD;
   }
 }
 
-const port = process.env.PORT || "3000";
-
-// Kill whatever is already listening on the port so we never get EADDRINUSE.
-const freePort = () =>
-  new Promise((resolve) => {
-    const { execSync } = require("child_process");
-    try {
-      if (process.platform === "win32") {
-        // Find PIDs on the port and kill them
-        const result = execSync(
-          `netstat -ano | findstr :${port}`,
-          { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
-        );
-        const pids = new Set(
-          result.split(/\r?\n/)
-            .map((l) => l.trim().split(/\s+/).pop())
-            .filter((p) => p && /^\d+$/.test(p) && p !== "0")
-        );
-        for (const pid of pids) {
-          try { execSync(`taskkill /PID ${pid} /F`, { stdio: "ignore" }); } catch (_) {}
-        }
-      } else {
-        execSync(`fuser -k ${port}/tcp`, { stdio: "ignore" });
-      }
-    } catch (_) { /* port was already free */ }
-    // Brief pause to let the OS release the port
-    setTimeout(resolve, 300);
-  });
-
-const startServer = (extraEnv = {}, onExit = () => {}) => {
+const startServer = (extraEnv = {}, onExit = () => { }) => {
   const server = spawn(process.execPath, [path.join(projectRoot, "server.js")], {
     cwd: projectRoot,
     env: { ...process.env, ...extraEnv },
@@ -85,24 +49,8 @@ const isHosted =
   Boolean(process.env.RENDER) ||
   Boolean(process.env.RENDER_SERVICE_ID);
 
-// Cloudflare Quick Tunnel URLs are temporary — they die when the tunnel stops.
-// If the saved PUBLIC_URL is a Quick Tunnel URL, clear it so we start a fresh tunnel.
-const savedUrl = process.env.PUBLIC_URL?.trim() || "";
-if (savedUrl && /trycloudflare\.com/i.test(savedUrl)) {
-  delete process.env.PUBLIC_URL;
-  // Also remove it from .env so we don't reuse a dead URL next time
-  try {
-    const envContent = fs.readFileSync(projectEnvPath, "utf8");
-    fs.writeFileSync(
-      projectEnvPath,
-      envContent.replace(/^\s*PUBLIC_URL\s*=.*(\r?\n)?/m, ""),
-      "utf8"
-    );
-  } catch (_) {}
-}
-
 if (process.env.PUBLIC_URL?.trim() || isHosted) {
-  freePort().then(() => startServer());
+  startServer();
 } else {
   const cloudflaredPath =
     process.env.CLOUDFLARED_PATH ||
@@ -152,10 +100,8 @@ if (process.env.PUBLIC_URL?.trim() || isHosted) {
 
     serverStarted = true;
     clearTimeout(startupTimer);
-    const tunnelUrl = match[0];
-    console.log(`Mobile-data link: ${tunnelUrl}`);
-
-    freePort().then(() => startServer({ PUBLIC_URL: tunnelUrl }, cleanup));
+    console.log(`Mobile-data link: ${match[0]}`);
+    startServer({ PUBLIC_URL: match[0] }, cleanup);
   });
 
   tunnel.on("error", (error) => {
