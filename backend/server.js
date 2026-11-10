@@ -1847,7 +1847,7 @@ app.post(
 // DASHBOARD
 // --------------------------------------------------
 
-require("./dashboard")(
+require("../dashboard")(
   app,
   {
     getDb: () => ({
