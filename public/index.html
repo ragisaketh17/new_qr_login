@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 
 <head>
@@ -12,10 +12,6 @@
     rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
   <link rel="stylesheet" href="style.css">
-
-
-  <!-- Google Sign-In library -->
-  <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 
 <body>
@@ -45,23 +41,43 @@
         <h2>Sign in to collect rewards</h2>
         <p class="sub">Every time you scan our QR code, your visit is counted and new offers unlock.</p>
 
-        <div class="google-wrap">
-          <div id="g_id_onload"
-            data-client_id="545672913408-f7eg6idlpuhpcr0ufldakiqtbaq5t9js.apps.googleusercontent.com"
-            data-callback="handleGoogle" data-auto_prompt="false"></div>
-          <div class="g_id_signin" data-type="standard" data-shape="pill" data-theme="outline" data-size="large"
-            data-text="continue_with" data-logo_alignment="left" data-width="280"></div>
-        </div>
-
-        <p id="google-error" class="error" role="alert" hidden></p>
-
-        <!-- Email form kept but hidden, so script.js still finds its elements -->
-        <form id="login-form" novalidate style="display:none">
+        <!-- Step 1: Enter Email -->
+        <form id="email-form" novalidate>
           <label for="email">Email address</label>
           <input id="email" name="email" type="email" inputmode="email" autocomplete="email"
             placeholder="name@example.com" required>
-          <p id="error" class="error" role="alert" hidden></p>
-          <button id="submit" class="primary" type="submit">Sign in</button>
+          <p id="email-hint" style="margin: 0.4rem 0 0; font-size: 0.85rem; color: #b45309; background: #fef9ec; padding: 0.4rem 0.65rem; border-radius: 7px; border: 1px solid #fde68a;" hidden>
+            ⚠️ Please use a <strong>Gmail address</strong> (e.g. yourname@gmail.com). Other email providers may not receive the code.
+          </p>
+          <p id="email-error" class="error" role="alert" hidden></p>
+          <button id="send-code-btn" class="primary" type="submit" style="margin-top: 1rem;">Send Verification Code</button>
+        </form>
+
+        <!-- Step 2: Enter OTP Code -->
+        <form id="otp-form" novalidate hidden>
+          <p style="margin: 0 0 0.85rem; font-size: 0.95rem; color: #555;">
+            We sent a 6-digit code to <strong id="sent-to-email"></strong>
+          </p>
+          <p id="dev-hint" style="margin: 0 0 0.85rem; font-size: 0.85rem; color: #b45309; background: #fef3c7; padding: 0.5rem 0.75rem; border-radius: 8px; border: 1px solid #fde68a;" hidden>
+            ⚡ <strong>Dev Mode:</strong> No SMTP email is configured in <code>.env</code>. Check your terminal/server console for the 6-digit OTP code!
+          </p>
+          <!-- Shown if page was refreshed and pendingEmail was lost (e.g. opened email on another browser) -->
+          <div id="otp-email-row" style="display:none; margin-bottom:0.75rem;">
+            <label for="otp-email-input" style="font-size:0.9rem;color:#555;">Confirm your email address</label>
+            <input id="otp-email-input" name="otp-email" type="email" inputmode="email"
+              placeholder="name@example.com" autocomplete="email" style="margin-top:0.3rem;">
+          </div>
+          <label for="otp">Enter 6-digit verification code</label>
+          <input id="otp" name="otp" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="6"
+            placeholder="123456" autocomplete="one-time-code" required
+            style="letter-spacing: 0.35em; font-size: 1.4rem; text-align: center; font-weight: 700; padding: 0.75rem;">
+          <p id="otp-error" class="error" role="alert" hidden></p>
+          <button id="verify-btn" class="primary" type="submit" style="margin-top: 1rem;">Verify & Sign In</button>
+
+          <div style="margin-top: 1.25rem; display: flex; justify-content: space-between; align-items: center; font-size: 0.9rem;">
+            <button id="resend-code-btn" type="button" style="background: none; border: none; cursor: pointer; padding: 0; color: #ff5a00; font-weight: 600;">Resend code</button>
+            <button id="change-email-btn" type="button" style="background: none; border: none; cursor: pointer; padding: 0; color: #777; text-decoration: underline;">Change email</button>
+          </div>
         </form>
       </section>
 
@@ -135,32 +151,7 @@
 
   <div class="toast" id="toast" role="status" hidden>Visit counted ✓</div>
 
-  <!-- Google callback: must be a global function -->
-  <script>
-    async function handleGoogle(response) {
-      const err = document.getElementById("google-error");
-      try {
-        const r = await fetch("/api/google-login", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ credential: response.credential }),
-        });
-        const data = await r.json().catch(() => ({}));
-        if (r.ok) {
-          location.reload(); // script.js then shows the rewards view
-        } else {
-          err.textContent = data.error || "Google sign-in failed. Try again.";
-          err.hidden = false;
-        }
-      } catch (e) {
-        err.textContent = "Network error. Try again.";
-        err.hidden = false;
-      }
-    }
-  </script>
-
-
-  <script src="script.js"></script>
+  <script src="script.js?v=6"></script>
 </body>
 
 </html>

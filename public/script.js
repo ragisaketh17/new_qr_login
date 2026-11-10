@@ -1,4 +1,4 @@
-const $ = (id) => document.getElementById(id);
+﻿const $ = (id) => document.getElementById(id);
 
 const topbar = $('topbar');
 const who = $('who');
@@ -6,10 +6,23 @@ const logoutBtn = $('logout');
 const strip = $('strip');
 const loginView = $('login-view');
 const rewardsView = $('rewards-view');
-const form = $('login-form');
+
+const emailForm = $('email-form');
+const otpForm = $('otp-form');
 const emailInput = $('email');
-const errorEl = $('error');
-const submitBtn = $('submit');
+const otpInput = $('otp');
+const emailError = $('email-error');
+const emailHint = $('email-hint');
+const otpError = $('otp-error');
+const sendCodeBtn = $('send-code-btn');
+const verifyBtn = $('verify-btn');
+const resendCodeBtn = $('resend-code-btn');
+const changeEmailBtn = $('change-email-btn');
+const sentToEmail = $('sent-to-email');
+const devHint = $('dev-hint');
+const otpEmailRow = $('otp-email-row');
+const otpEmailInput = $('otp-email-input');
+
 const visitCount = $('visit-count');
 const visitWord = $('visit-word');
 const tracker = $('tracker');
@@ -45,6 +58,20 @@ let popupRewardIndex = -1;  // reward shown in the visit pop-up (-1 = none)
 let toastTimer = null;
 
 const STATUS_TEXT = { claimed: 'Claimed', available: 'Available', locked: 'Locked' };
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+// Warn if the typed email is not a Gmail address
+function checkEmailHint(email) {
+  if (!emailHint) return;
+  const val = email.trim().toLowerCase();
+  const hasAt = val.includes('@');
+  // Show warning only after user has typed an @ and the domain is not gmail.com
+  if (hasAt && val.length > 3 && !val.endsWith('@gmail.com') && !val.includes('@gmail.com')) {
+    emailHint.hidden = false;
+  } else {
+    emailHint.hidden = true;
+  }
+}
 
 // ---------- Social links ----------
 // Put your real links here. The server (/api/config) overrides these when it sends its own.
@@ -121,10 +148,33 @@ function formatDate(iso) {
   return `${d.getDate()} ${month} '${String(d.getFullYear()).slice(-2)}`;
 }
 
+async function parseResponse(res) {
+  try {
+    const text = await res.text();
+    return text ? JSON.parse(text) : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function showEmailError(message) {
+  if (emailError) {
+    emailError.textContent = message;
+    emailError.hidden = !message;
+    if (emailInput) emailInput.setAttribute('aria-invalid', message ? 'true' : 'false');
+  }
+}
+
+function showOtpError(message) {
+  if (otpError) {
+    otpError.textContent = message;
+    otpError.hidden = !message;
+    if (otpInput) otpInput.setAttribute('aria-invalid', message ? 'true' : 'false');
+  }
+}
+
 function showError(message) {
-  errorEl.textContent = message;
-  errorEl.hidden = !message;
-  emailInput.setAttribute('aria-invalid', message ? 'true' : 'false');
+  showEmailError(message);
 }
 
 function showToast(message) {
@@ -394,7 +444,7 @@ async function claimOffer(offer) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ minVisits: offer.minVisits })
     });
-    const data = await res.json();
+    const data = await parseResponse(res);
     if (!res.ok) throw new Error(data.error || 'Could not claim. Try again.');
 
     showRewards(data, true);
@@ -406,6 +456,7 @@ async function claimOffer(offer) {
 
 // ---------- Screens ----------
 function showRewards(data, keepSelection = false) {
+  clearPendingEmail();   // logged in — no longer need the saved email
   state = data;
   if (!keepSelection) selectedIndex = Math.max(0, data.currentIndex);
 
@@ -435,43 +486,212 @@ function showRewards(data, keepSelection = false) {
   if (!rewardsPage.hidden) renderPage();
 }
 
-function showLogin(offers) {
+let pendingEmail = '';
+
+function savePendingEmail(email) {
+  pendingEmail = email || '';
+  try { sessionStorage.setItem('otp_email', pendingEmail); } catch (_) {}
+}
+
+function loadPendingEmail() {
+  try { pendingEmail = sessionStorage.getItem('otp_email') || ''; } catch (_) {}
+  return pendingEmail;
+}
+
+function clearPendingEmail() {
+  pendingEmail = '';
+  try { sessionStorage.removeItem('otp_email'); } catch (_) {}
+}
+
+function showLogin(offers, restoreOtpStep) {
   state = null;
   closePopup();
   closePage();
   topbar.hidden = true;
   rewardsView.hidden = true;
   loginView.hidden = false;
+
+  const saved = loadPendingEmail();
+
+  // If we have a saved email and OTP form already dispatched, re-show the OTP step
+  if (restoreOtpStep && saved) {
+    if (emailForm) emailForm.hidden = true;
+    if (otpForm) otpForm.hidden = false;
+    if (sentToEmail) sentToEmail.textContent = saved;
+    if (devHint) devHint.hidden = true;
+    // Show the "confirm email" row in case saved email needs correction
+    if (otpEmailRow) { otpEmailRow.style.display = 'block'; }
+    if (otpEmailInput) { otpEmailInput.value = saved; }
+    showOtpError('');
+    if (otpInput) otpInput.focus();
+  } else {
+    clearPendingEmail();
+    if (emailForm) emailForm.hidden = false;
+    if (otpForm) otpForm.hidden = true;
+    if (otpEmailRow) otpEmailRow.style.display = 'none';
+    if (devHint) devHint.hidden = true;
+    showEmailError('');
+    showOtpError('');
+  }
+
   renderStrip(offers || [], null);
 }
 
 // ---------- Events ----------
-form.addEventListener('submit', async (event) => {
+
+// Live Gmail warning as the user types
+emailInput?.addEventListener('input', () => {
+  checkEmailHint(emailInput.value);
+  if (emailHint && !emailHint.hidden) showEmailError(''); // clear submit error while retyping
+});
+
+emailForm?.addEventListener('submit', async (event) => {
   event.preventDefault();
-  showError('');
-  submitBtn.disabled = true;
+  showEmailError('');
 
   try {
-    const res = await fetch('/api/login', {
+    const email = String(emailInput?.value || '').trim().toLowerCase();
+
+    if (!email || !EMAIL_PATTERN.test(email)) {
+      showEmailError('Please enter a valid email address (e.g. yourname@gmail.com).');
+      if (emailInput) emailInput.focus();
+      return;
+    }
+
+    sendCodeBtn.disabled = true;
+    sendCodeBtn.textContent = 'Sending code...';
+
+    const res = await fetch('/api/send-otp', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: emailInput.value })
+      body: JSON.stringify({ email })
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Something went wrong. Try again.');
+    const data = await parseResponse(res);
+    if (!res.ok) throw new Error(data.error || 'Could not send verification code.');
+
+    savePendingEmail(email);
+    if (sentToEmail) sentToEmail.textContent = email;
+    if (devHint) devHint.hidden = !data.devMode;
+    if (emailHint) emailHint.hidden = true;        // hide gmail warning once code is sent
+    if (otpEmailRow) otpEmailRow.style.display = 'none';
+    emailForm.hidden = true;
+    otpForm.hidden = false;
+    showOtpError('');
+    if (otpInput) {
+      otpInput.value = '';
+      otpInput.focus();
+    }
+    showToast(data.message || 'Verification code sent!');
+  } catch (err) {
+    showEmailError(err.message || 'Could not send code. Please try again.');
+  } finally {
+    sendCodeBtn.disabled = false;
+    sendCodeBtn.textContent = 'Send Verification Code';
+  }
+});
+
+otpForm?.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  showOtpError('');
+
+  try {
+    const code = String(otpInput?.value || '').trim();
+
+    if (!code || !/^\d{6}$/.test(code)) {
+      showOtpError('Please enter a valid 6-digit code.');
+      if (otpInput) otpInput.focus();
+      return;
+    }
+
+    const email =
+      pendingEmail ||
+      String(otpEmailInput?.value || '').trim().toLowerCase() ||
+      String(emailInput?.value || '').trim().toLowerCase();
+
+    if (!email || !EMAIL_PATTERN.test(email)) {
+      showOtpError('Email address is missing or invalid. Please use "Change email" to go back.');
+      if (otpEmailRow) otpEmailRow.style.display = 'block';
+      if (otpEmailInput) otpEmailInput.focus();
+      return;
+    }
+
+    verifyBtn.disabled = true;
+    verifyBtn.textContent = 'Verifying...';
+
+    const res = await fetch('/api/verify-otp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, code })
+    });
+    const data = await parseResponse(res);
+    if (!res.ok) throw new Error(data.error || 'Invalid or expired code.');
 
     showRewards(data);
     if (data.newVisit) showVisitPopup(data);
   } catch (err) {
-    showError(err.message);
+    showOtpError(err.message || 'Verification failed. Please try again.');
   } finally {
-    submitBtn.disabled = false;
+    verifyBtn.disabled = false;
+    verifyBtn.textContent = 'Verify & Sign In';
+  }
+});
+
+resendCodeBtn?.addEventListener('click', async () => {
+  showOtpError('');
+  const email =
+    pendingEmail ||
+    String(otpEmailInput?.value || '').trim().toLowerCase() ||
+    String(emailInput?.value || '').trim().toLowerCase();
+
+  if (!email || !EMAIL_PATTERN.test(email)) {
+    if (otpEmailRow) otpEmailRow.style.display = 'block';
+    showOtpError('Enter your email address above, then click Resend.');
+    if (otpEmailInput) otpEmailInput.focus();
+    return;
+  }
+
+  resendCodeBtn.disabled = true;
+  resendCodeBtn.textContent = 'Resending...';
+
+  try {
+    const res = await fetch('/api/send-otp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email })
+    });
+    const data = await parseResponse(res);
+    if (!res.ok) throw new Error(data.error || 'Could not resend code.');
+    savePendingEmail(email);  // keep email saved after resend
+    if (sentToEmail) sentToEmail.textContent = email;
+    if (otpEmailRow) otpEmailRow.style.display = 'none';
+    showToast('New code sent to your email!');
+  } catch (err) {
+    showOtpError(err.message);
+  } finally {
+    setTimeout(() => {
+      resendCodeBtn.disabled = false;
+      resendCodeBtn.textContent = 'Resend code';
+    }, 4000);
+  }
+});
+
+changeEmailBtn?.addEventListener('click', () => {
+  clearPendingEmail();
+  otpForm.hidden = true;
+  emailForm.hidden = false;
+  showEmailError('');
+  if (emailHint) emailHint.hidden = true;
+  if (emailInput) {
+    emailInput.focus();
+    emailInput.select();
   }
 });
 
 logoutBtn.addEventListener('click', async () => {
   try { await fetch('/api/logout', { method: 'POST' }); } catch (_) { }
-  emailInput.value = '';
+  if (emailInput) emailInput.value = '';
+  if (otpInput) otpInput.value = '';
+  clearPendingEmail();
   init();
 });
 
@@ -508,7 +728,7 @@ window.addEventListener('resize', () => { if (state) positionArrow(); });
 async function loadReviewLink() {
   try {
     const res = await fetch('/api/config');
-    const data = await res.json();
+    const data = await parseResponse(res);
 
     links = {
       google: data.googleReviewUrl || links.google,
@@ -535,22 +755,40 @@ async function loadReviewLink() {
 
 // Runs every time the page opens.
 async function init() {
-  // /scan sends people here with ?counted=1 after adding a visit
-  const counted = new URLSearchParams(location.search).get('counted') === '1';
+  const urlParams = new URLSearchParams(location.search);
+  const counted = urlParams.get('counted') === '1';
+  const authError = urlParams.get('error');
+
   if (location.search) history.replaceState(null, '', location.pathname);
+
+  // If user came back from an email link that failed, clear any pending state
+  if (authError === 'invalid-code') clearPendingEmail();
+
+  // Check whether there's a saved pending email (e.g. user went to email, came back)
+  const hasPendingOtp = Boolean(loadPendingEmail());
 
   try {
     const res = await fetch('/api/me');
-    const data = await res.json();
+    const data = await parseResponse(res);
     if (res.ok) {
       showRewards(data);
       if (counted) showVisitPopup(data);
       return;
     }
-    showLogin(data.offers);
+    // Not logged in — restore OTP step if we had a pending email
+    showLogin(data.offers, hasPendingOtp);
+    if (authError === 'invalid-code') {
+      clearPendingEmail();
+      showEmailError('Verification link was invalid or expired. Please enter your email to get a new code.');
+    }
     return;
   } catch (_) { }
-  showLogin([]);
+
+  showLogin([], hasPendingOtp);
+  if (authError === 'invalid-code') {
+    clearPendingEmail();
+    showEmailError('Verification link was invalid or expired. Please enter your email to get a new code.');
+  }
 }
 
 loadReviewLink();
