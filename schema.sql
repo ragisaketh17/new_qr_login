@@ -94,3 +94,18 @@ CREATE TABLE IF NOT EXISTS `reviews` (
   KEY `idx_reviews_publishedAt` (`publishedAt`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- --------------------------------------------------------------
+-- 8. Email OTPs Table
+-- Stores 6-digit one-time verification codes for SMTP email login
+-- --------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `email_otps` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `email` VARCHAR(254) NOT NULL,
+  `codeHash` CHAR(64) NOT NULL,
+  `expiresAt` BIGINT NOT NULL,
+  `createdAt` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `idx_email_otps_email` (`email`),
+  KEY `idx_email_otps_expiresAt` (`expiresAt`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+

@@ -18,7 +18,7 @@ if (fs.existsSync(projectEnvPath)) {
 }
 
 const startServer = (extraEnv = {}, onExit = () => { }) => {
-  const server = spawn(process.execPath, [path.join(projectRoot, "server.js")], {
+  const server = spawn(process.execPath, [path.join(projectRoot, "backend", "server.js")], {
     cwd: projectRoot,
     env: { ...process.env, ...extraEnv },
     stdio: "inherit",

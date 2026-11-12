@@ -2,18 +2,19 @@
   "name": "qr-email-login",
   "version": "1.0.0",
   "description": "QR visit and rewards web app with email sign-in",
-  "main": "server.js",
+  "main": "backend/server.js",
   "scripts": {
-    "start": "node server.js",
-    "qr": "node qr.js"
+    "start": "node backend/server.js",
+    "qr": "node qr.js",
+    "tunnel": "node start.js"
   },
   "engines": {
-    "node": "22.x"
+    "node": ">=18.0.0"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "google-auth-library": "^9.15.0",
     "mysql2": "^3.14.5",
+    "nodemailer": "^10.5.0",
     "qrcode": "^1.5.4"
   }
 }
