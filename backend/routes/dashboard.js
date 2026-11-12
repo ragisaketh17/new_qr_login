@@ -1,4 +1,6 @@
 const express = require("express");
+const fs = require("fs");
+const path = require("path");
 const crypto = require("crypto");
 const router = express.Router();
 const queries = require("../db/queries");
@@ -117,7 +119,17 @@ const DASHBOARD_HTML = Buffer.from(
 // --------------------------------------------------
 // DASHBOARD PAGES
 // --------------------------------------------------
+const dashboardHtmlCandidates = [
+  path.join(__dirname, "..", "..", "frontend", "dashboard.html"),
+  path.join(__dirname, "..", "frontend", "dashboard.html"),
+  path.join(process.cwd(), "frontend", "dashboard.html")
+];
+
 router.get(["/dashboard", "/dashboard.html"], (req, res) => {
+  const htmlFile = dashboardHtmlCandidates.find((p) => fs.existsSync(p));
+  if (htmlFile) {
+    return res.sendFile(htmlFile);
+  }
   res.type("html").send(DASHBOARD_HTML);
 });
 
